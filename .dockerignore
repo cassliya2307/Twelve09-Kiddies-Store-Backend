@@ -15,6 +15,7 @@ __pycache__
 *.db
 *.sql
 *.txt
+!requirements.txt
 *.bak
 *.backup
 static/uploads/*
@@ -34,6 +35,6 @@ production_schema_backup.sql
 test_output.txt
 test_pay1.txt
 test_pay2.txt
-test_pay3.txt
 test_pay4.txt
+test_pay3.txt
 test_results.txt
