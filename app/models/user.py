@@ -6,7 +6,7 @@ from enum import Enum
 from sqlalchemy import JSON, Boolean, DateTime, Enum as SQLAlchemyEnum, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core.database import Base
+from app.core.database import Base, utcnow
 
 
 class UserRole(str, Enum):
@@ -21,6 +21,7 @@ class Permission(str, Enum):
     MANAGE_ORDERS = "MANAGE_ORDERS"
     MANAGE_CUSTOMERS = "MANAGE_CUSTOMERS"
     MANAGE_DELIVERIES = "MANAGE_DELIVERIES"
+    MANAGE_EXPENSES = "MANAGE_EXPENSES"
     VIEW_REPORTS = "VIEW_REPORTS"
 
 
@@ -34,8 +35,8 @@ class User(Base):
     role: Mapped[UserRole] = mapped_column(SQLAlchemyEnum(UserRole), nullable=False, default=UserRole.CUSTOMER)
     permissions: Mapped[list[Permission]] = mapped_column(JSON, nullable=False, default=list)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow, onupdate=utcnow)
 
     addresses: Mapped[list["Address"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     orders: Mapped[list["Order"]] = relationship(back_populates="user")

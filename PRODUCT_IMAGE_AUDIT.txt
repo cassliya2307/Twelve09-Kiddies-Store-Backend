@@ -1,0 +1,179 @@
+PRODUCT IMAGE AUDIT REPORT
+=========================
+
+Existing functionality:
+-----------------------
+- Product creation, update, and read endpoints already support an `image_url` field
+- Image URL is a client-provided string (no server-side file upload handling)
+- Products can be filtered/listed by image URL presence
+- Admin can update product image URL via PUT /products/{id}
+- No file validation, size limits, or security measures exist
+- No image upload endpoints exist
+- No image deletion or replacement logic beyond overwriting the URL
+
+Product model:
+--------------
+- Model: app/models/product.py:22
+- Field: image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+- Type: VARCHAR(500) in MySQL
+- Nullable: True (products can have no image)
+- Current usage: Stores a URL or file path provided by the client
+- No validation at the model level
+- No relationship to stored files
+
+Current storage:
+----------------
+- NO file-storage system exists in the backend
+- NO upload endpoints exist
+- NO configuration for local filesystem or cloud storage
+- NO directory configured for image storage
+- The `image_url` field is merely a string pass-through - clients provide the URL/path
+- Pillow (PIL) version 12.1.1 is installed but not used for image processing
+- python-multipart version 0.0.27 is installed (FastAPI file upload support)
+
+Recommended design:
+-------------------
+Add local file upload functionality while keeping the existing `image_url` field.
+The `image_url` will store a server-generated path/URL to the uploaded file.
+
+Key principles:
+- Server-generated filenames (never trust client-provided names)
+- Validation of file extensions and MIME types
+- File size limits
+- Admin-only upload/replacement permissions
+- Secure storage directory outside web root or with proper protection
+- Image processing with Pillow (resize, format conversion)
+- Cleanup on product deletion
+
+Two implementation options:
+
+OPTION A: URL-based (minimal change)
+- Keep image_url as-is
+- Add URL format validation (valid image extension)
+- Admin uploads images manually to a designated folder
+- image_url stores the path/URL to the manually placed file
+- Lowest risk, fastest implementation
+
+OPTION B: Full local file upload
+- Add multipart/form-data upload endpoint
+- Server generates safe filenames using UUID + extension
+- Validate extensions (.jpg, .jpeg, .png, .webp)
+- Validate file size (e.g., 5MB limit)
+- Use Pillow to verify image integrity, optionally resize
+- Store images in static/uploads/ directory
+- image_url stores the path like /uploads/filename.jpg
+- More complete feature, matches security requirements
+
+Given the constraint "Do NOT add a cloud storage service unless the project already uses one" 
+and "Prefer the smallest implementation compatible with the current architecture", 
+OPTION A is recommended as the baseline, with OPTION B as an enhancement.
+
+However, the security requirements ("Validate file extension/type appropriately", 
+"Enforce a file-size limit", "Generate safe server-side filenames", 
+"Prevent path traversal") are more aligned with OPTION B.
+
+Recommended: OPTION B (full local upload) with the following minimal implementation:
+
+Supported image types:
+----------------------
+- .jpg, .jpeg (JPEG images)
+- .png (PNG images, including transparency)
+- .webp (WebP images, modern format)
+- .gif (animated GIFs, optional)
+
+Maximum file size:
+------------------
+- Recommended: 5 MB (5 * 1024 * 1024 bytes)
+- Configurable via environment variable or setting
+- Enforced at upload endpoint
+
+Required database changes:
+------------------------
+- NONE required - the existing `image_url` field is sufficient
+- No schema migrations needed
+- The field stores the server-generated path or URL
+
+Required files:
+---------------
+1. app/core/config.py - Settings for upload directory and max size
+2. app/schemas/product_image.py - Schemas for upload requests/responses
+3. app/services/product_image.py - Image processing and storage services
+4. app/api/v1/products.py (or modify existing) - Upload endpoints
+5. static/uploads/ directory - Created at startup (or use app/core/files.py)
+
+Required endpoints:
+-------------------
+1. POST /products/{product_id}/upload-image
+   - Admin-only (require_admin or permission MANAGE_PRODUCTS)
+   - Multipart form-data with "file" field
+   - Returns image_url, size, format
+   - Validates extension, size, image integrity
+
+2. (Optional) DELETE /products/{product_id}/image
+   - Admin-only
+   - Removes file from storage
+   - Sets image_url to None
+
+3. (Existing) PUT /products/{product_id}
+   - Already supports image_url update
+   - Should validate that new image_url is valid if provided
+
+Security rules:
+---------------
+- ✅ Do not trust client-provided MIME type alone - validate extension against allowed list
+- ✅ Validate file extension/type appropriately - only .jpg, .jpeg, .png, .webp, .gif
+- ✅ Enforce a file-size limit - 5MB maximum
+- ✅ Generate safe server-side filenames - UUID-based names like `a1b2c3d4_e5f6.jpg`
+- ✅ Prevent path traversal - sanitize all filenames, store outside DOCUMENT_ROOT or with path checks
+- ✅ Do not allow arbitrary executable files - only allow image extensions
+- ✅ Product image modification restricted to authorized product-management users/admins
+  - require_admin(current_user) or require_permission(current_user, Permission.MANAGE_PRODUCTS)
+- ✅ Customers must not be able to upload or replace product images
+  - All image upload endpoints require admin permissions
+
+Required tests:
+---------------
+1. Test admin can upload image to product (POST /products/{id}/upload-image)
+2. Test non-admin receives 403 on image upload
+3. Test upload with invalid extension returns 400
+4. Test upload with file > 5MB returns 413 or 400
+5. Test upload with non-image file (e.g., .exe) returns 400
+6. Test upload with corrupt/non-image binary returns 400 (Pillow verification)
+7. Test product image URL is stored correctly after upload
+8. Test product image can be updated by admin
+9. Test product with no image still works (image_url is None)
+10. Test image URL is returned in ProductRead and ProductListRead
+11. Test image deletion/removal sets image_url to None
+12. Test that same filename cannot be uploaded (UUID prevents this)
+
+Potential risks:
+---------------
+- ⚠️ File storage could fill disk space if not managed (consider cleanup on deletion)
+- ⚠️ Concurrent uploads could have race conditions on filename generation (UUID mitigates this)
+- ⚠️ Image processing with Pillow could fail on extremely unusual formats
+- ⚠️ If static/uploads/ is served publicly, ensure no sensitive files are nearby
+- ⚠️ Browser-based uploads could be used for DoS if size limits not enforced
+- ⚠️ Existing products without images need migration (image_url is nullable, so OK)
+- ⚠️ URL format in image_url must be consistent with what frontend expects
+
+Implementation priority:
+-----------------------
+1. Add upload directory configuration (app/core/config.py)
+2. Add image service with validation and storage (app/services/product_image.py)
+3. Add upload endpoint to product API (modify main.py products routes)
+4. Add schemas for upload request/response (app/schemas/product_image.py)
+5. Add business rule tests (tests/test_business_rules.py)
+6. Run full test suite to verify no regressions
+
+Files that would need modification:
+-----------------------------------
+- app/core/config.py (new or modify existing)
+- app/services/product_image.py (new)
+- app/schemas/product_image.py (new)
+- app/main.py (add upload endpoints, modify product update)
+- app/models/product.py (no changes needed - image_url already exists)
+- app/models/__init__.py (no changes needed)
+- static/uploads/ directory (create at startup or in Docker init)
+
+The existing test suite (69 pass, 2 pre-existing failures) should continue to pass
+since no database schema changes are required and the existing image_url field is preserved.

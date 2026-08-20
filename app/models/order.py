@@ -7,7 +7,7 @@ from enum import Enum
 from sqlalchemy import DECIMAL, DateTime, Enum as SQLAlchemyEnum, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core.database import Base
+from app.core.database import Base, utcnow
 
 
 class OrderStatus(str, Enum):
@@ -42,8 +42,8 @@ class Order(Base):
     delivery_city: Mapped[str | None] = mapped_column(String(100), nullable=True)
     delivery_state: Mapped[str | None] = mapped_column(String(100), nullable=True)
     delivery_additional_directions: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow, onupdate=utcnow)
 
     user: Mapped["User"] = relationship(back_populates="orders")
     address: Mapped["Address"] = relationship(back_populates="orders")

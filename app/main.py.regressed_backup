@@ -1,16 +1,7 @@
-from contextlib import asynccontextmanager
-from datetime import timezone
-import logging
-import sys
-from uuid import uuid4
-
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from fastapi import Depends, FastAPI, HTTPException, status
 from sqlalchemy.orm import Session
 
 from decimal import Decimal
-from pathlib import Path
 
 from app.core.auth import (
     create_access_token,
@@ -20,27 +11,20 @@ from app.core.auth import (
     require_permission,
     verify_password,
 )
-from app.core.database import get_db, settings
+from app.core.database import get_db
 from app.models import (
     Address,
     Category,
-    DeliveryConfig,
     FulfillmentMethod,
     Order,
     OrderItem,
     OrderStatus,
     Permission,
-    Payment,
-    PaymentStatus,
-    Expense,
     Product,
     User,
     UserRole,
 )
 from app.schemas.address import AddressCreate, AddressRead, AddressUpdate
-from app.schemas.delivery_fee import DeliveryFeeRead, DeliveryFeeUpdate
-from app.schemas.payment import PaymentCreate, PaymentRead, PaymentStatusUpdate
-from app.schemas.expense import ExpenseCreate, ExpenseRead
 from app.schemas.checkout import (
     CartItemDetails,
     CheckoutRequest,
@@ -57,61 +41,11 @@ from app.schemas.product import (
     ProductUpdate,
     StockUpdate,
 )
-from app.schemas.product_image import (
-    ProductImageDeleteResponse,
-    ProductImageUploadResponse,
-)
 from app.schemas.user import UserCreate, UserRead, UserUpdate
-from app.services.product_image import (
-    destroy_cloudinary_image,
-    extract_our_public_id,
-    is_our_cloudinary_url,
-    upload_to_cloudinary,
-    _validate_and_prepare_upload,
-)
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("twelve09")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting Twelve09 Kiddies Store API")
-    from app.core.database import engine
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        logger.info("Database connection verified")
-    except Exception as e:
-        logger.error("Database connection failed: %s", e)
-        raise
-    yield
-    logger.info("Shutting down Twelve09 Kiddies Store API")
-
-
-docs_url = "/docs" if settings.ENVIRONMENT == "development" else None
-redoc_url = "/redoc" if settings.ENVIRONMENT == "development" else None
 
 app = FastAPI(
     title="Twelve09 Kiddies Store API",
     version="1.0.0",
-    lifespan=lifespan,
-    docs_url=docs_url,
-    redoc_url=redoc_url,
-)
-
-allowed_origins = [o.strip() for o in settings.CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 
@@ -160,52 +94,6 @@ def health_check():
     }
 
 
-@app.get("/admin/delivery-fee", response_model=DeliveryFeeRead)
-def get_delivery_fee(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if not require_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator privileges required",
-        )
-
-    config = db.query(DeliveryConfig).first()
-    if config is None:
-        config = DeliveryConfig(fee_amount=0.00, is_active=True)
-        db.add(config)
-        db.commit()
-        db.refresh(config)
-
-    return DeliveryFeeRead.model_validate(config)
-
-
-@app.patch("/admin/delivery-fee", response_model=DeliveryFeeRead)
-def update_delivery_fee(
-    payload: DeliveryFeeUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if not require_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator privileges required",
-        )
-
-    config = db.query(DeliveryConfig).first()
-    if config is None:
-        config = DeliveryConfig(fee_amount=payload.fee_amount, is_active=True)
-        db.add(config)
-    else:
-        config.fee_amount = payload.fee_amount
-
-    db.commit()
-    db.refresh(config)
-
-    return DeliveryFeeRead.model_validate(config)
-
-
 @app.post("/auth/register", response_model=UserRead)
 def register_user(user_in: UserCreate, db: Session = Depends(get_db)) -> User:
     existing_user = db.query(User).filter(User.email == str(user_in.email)).first()
@@ -219,7 +107,7 @@ def register_user(user_in: UserCreate, db: Session = Depends(get_db)) -> User:
         name=user_in.name,
         email=str(user_in.email),
         password_hash=hash_password(user_in.password),
-        role=UserRole.CUSTOMER,
+        role=user_in.role,
         permissions=[],
         is_active=True,
     )
@@ -332,11 +220,6 @@ def update_user_role(
         )
 
     if payload.role is not None:
-        if payload.role == UserRole.ADMIN:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Cannot promote a user to administrator. Only one administrator is allowed.",
-            )
         target_user.role = payload.role
         if payload.role != UserRole.STAFF:
             target_user.permissions = []
@@ -513,101 +396,6 @@ def deactivate_product(
     return product
 
 
-@app.post("/products/{product_id}/upload-image", response_model=ProductImageUploadResponse)
-def upload_product_image(
-    product_id: int,
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> ProductImageUploadResponse:
-    if not (require_admin(current_user) or require_permission(current_user, Permission.MANAGE_PRODUCTS)):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Product management permission required",
-        )
-
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-
-    max_size = int(settings.PRODUCT_IMAGE_MAX_SIZE)
-    chunks = []
-    total_size = 0
-    chunk_size = 8192
-    while True:
-        chunk = file.file.read(chunk_size)
-        if not chunk:
-            break
-        total_size += len(chunk)
-        if total_size > max_size:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File too large: {total_size / 1024 / 1024:.2f} MB. Maximum: {max_size / 1024 / 1024:.0f} MB",
-            )
-        chunks.append(chunk)
-    file_content = b"".join(chunks)
-
-    success, error_message, extension = _validate_and_prepare_upload(file_content, file.filename or "")
-    if not success:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_message)
-
-    success, secure_url, public_id, size_bytes = upload_to_cloudinary(file_content, product_id, extension)
-    if not success:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=secure_url)
-
-    previous_image_url = product.image_url
-    product.image_url = secure_url
-    db.add(product)
-    db.commit()
-    db.refresh(product)
-
-    # Delete old managed Cloudinary asset if it exists
-    if previous_image_url and is_our_cloudinary_url(previous_image_url):
-        old_public_id = extract_our_public_id(previous_image_url)
-        if old_public_id:
-            destroy_cloudinary_image(old_public_id)
-
-    return ProductImageUploadResponse(
-        image_url=secure_url,
-        filename=public_id,
-        size_bytes=size_bytes or total_size,
-    )
-
-
-@app.delete("/products/{product_id}/image", response_model=ProductImageDeleteResponse)
-def delete_product_image(
-    product_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> ProductImageDeleteResponse:
-    if not (require_admin(current_user) or require_permission(current_user, Permission.MANAGE_PRODUCTS)):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Product management permission required",
-        )
-
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-
-    previous_image_url = product.image_url
-    deleted = False
-    if previous_image_url and is_our_cloudinary_url(previous_image_url):
-        public_id = extract_our_public_id(previous_image_url)
-        if public_id:
-            deleted = destroy_cloudinary_image(public_id)
-
-    product.image_url = None
-    db.add(product)
-    db.commit()
-    db.refresh(product)
-
-    return ProductImageDeleteResponse(
-        deleted=deleted,
-        image_url_before=previous_image_url,
-    )
-
-
 @app.get("/categories", response_model=list[CategoryRead])
 def list_categories(
     skip: int = 0,
@@ -727,20 +515,7 @@ def _validate_checkout_items(
     if errors:
         return False, errors, None
 
-    # Read delivery fee from server configuration, with business rule:
-    # - STORE_PICKUP always has fee = 0.00
-    # - STORE_DELIVERY and CUSTOMER_DISPATCH use configured fee
-    config = db.query(DeliveryConfig).first()
-    if config is None:
-        config = DeliveryConfig(fee_amount=0.00, is_active=True)
-        db.add(config)
-        db.commit()
-        db.refresh(config)
-
-    if fulfillment_enum == FulfillmentMethod.STORE_PICKUP:
-        delivery_fee = Decimal("0.00")
-    else:
-        delivery_fee = config.fee_amount
+    delivery_fee = Decimal("0.00")
     total_amount = subtotal + delivery_fee
 
     summary = CheckoutSummary(
@@ -838,12 +613,7 @@ def create_order(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Quantity must be greater than zero")
         product_quantities[item.product_id] = product_quantities.get(item.product_id, 0) + item.quantity
 
-    products = (
-        db.query(Product)
-        .filter(Product.id.in_(product_quantities.keys()))
-        .with_for_update()
-        .all()
-    )
+    products = db.query(Product).filter(Product.id.in_(product_quantities.keys())).all()
     product_map = {product.id: product for product in products}
 
     missing_product_ids = set(product_quantities.keys()) - set(product_map.keys())
@@ -873,20 +643,12 @@ def create_order(
             )
         )
 
-    # Read delivery fee from server configuration, with business rule:
-    # - STORE_PICKUP always has fee = 0.00
-    # - STORE_DELIVERY and CUSTOMER_DISPATCH use configured fee
-    config = db.query(DeliveryConfig).first()
-    if config is None:
-        config = DeliveryConfig(fee_amount=0.00, is_active=True)
-        db.add(config)
-        db.commit()
-        db.refresh(config)
-
-    if fulfillment_method == FulfillmentMethod.STORE_PICKUP:
+    delivery_fee = Decimal("0.00")
+    if fulfillment_method == FulfillmentMethod.STORE_DELIVERY:
         delivery_fee = Decimal("0.00")
-    else:
-        delivery_fee = config.fee_amount
+    if fulfillment_method == FulfillmentMethod.CUSTOMER_DISPATCH:
+        delivery_fee = Decimal("0.00")
+
     total_amount = subtotal + delivery_fee
 
     order = Order(
@@ -1072,25 +834,6 @@ def checkout(
 
     product_quantities: dict[int, int] = {item.product_id: item.quantity for item in cart_items}
 
-    products = (
-        db.query(Product)
-        .filter(Product.id.in_(product_quantities.keys()))
-        .with_for_update()
-        .all()
-    )
-    product_map = {product.id: product for product in products}
-
-    missing_product_ids = set(product_quantities.keys()) - set(product_map.keys())
-    if missing_product_ids:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or more products were not found")
-
-    for product_id, quantity in product_quantities.items():
-        product = product_map[product_id]
-        if not product.is_active:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Product {product.name} is not available")
-        if quantity > product.stock_quantity:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Insufficient stock for product {product.name}")
-
     order = Order(
         user_id=current_user.id,
         address_id=address.id if address else None,
@@ -1127,9 +870,10 @@ def checkout(
         db.add(order_item)
 
     for product_id, quantity in product_quantities.items():
-        product = product_map[product_id]
-        product.stock_quantity -= quantity
-        db.add(product)
+        product = db.query(Product).filter(Product.id == product_id).first()
+        if product:
+            product.stock_quantity -= quantity
+            db.add(product)
 
     db.commit()
     db.refresh(order)
@@ -1167,163 +911,6 @@ def create_address(
     db.commit()
     db.refresh(address)
     return address
-
-
-# ---- Payment Routes ----
-
-@app.post("/payments", response_model=PaymentRead)
-def create_payment(
-    payload: PaymentCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> PaymentRead:
-    """Create a payment for an order."""
-    # Validate order exists
-    order = db.query(Order).filter(Order.id == payload.order_id).first()
-    if order is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found",
-        )
-
-    # Check ownership: user can pay for their own orders, admin can pay for any
-    if order.user_id != current_user.id:
-        if not require_admin(current_user):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to pay for this order",
-            )
-
-    # Prevent duplicate payment
-    existing_payment = db.query(Payment).filter(Payment.order_id == payload.order_id).first()
-    if existing_payment is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="A payment already exists for this order",
-        )
-
-    payment = Payment(
-        order_id=payload.order_id,
-        amount=order.total_amount,
-        payment_method=payload.payment_method,
-        transaction_reference=payload.transaction_reference,
-        status=PaymentStatus.PENDING,
-    )
-    db.add(payment)
-    db.commit()
-    db.refresh(payment)
-    return payment
-
-
-@app.get("/payments", response_model=list[PaymentRead])
-def list_payments(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[Payment]:
-    """List payments. Admin sees all; users see only their order payments."""
-    if require_admin(current_user):
-        return db.query(Payment).all()
-
-    # Users can only see payments for their own orders
-    user_orders = db.query(Order).filter(Order.user_id == current_user.id).all()
-    order_ids = [o.id for o in user_orders]
-    return db.query(Payment).filter(Payment.order_id.in_(order_ids)).all()
-
-
-@app.get("/payments/{payment_id}", response_model=PaymentRead)
-def get_payment(
-    payment_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> Payment:
-    """Retrieve a specific payment."""
-    payment = db.query(Payment).filter(Payment.id == payment_id).first()
-    if payment is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Payment not found",
-        )
-
-    # Check ownership: user can access payment for their order, admin can access any
-    if payment.order.user_id != current_user.id:
-        if not require_admin(current_user):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to access this payment",
-            )
-
-    return payment
-
-
-@app.get("/orders/{order_id}/payments", response_model=PaymentRead | None)
-def get_payment_for_order(
-    order_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> Payment | None:
-    """Retrieve payment for a specific order."""
-    # Validate order exists and user owns it (or admin)
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if order is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found",
-        )
-
-    if order.user_id != current_user.id:
-        if not require_admin(current_user):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to access payments for this order",
-            )
-
-    payment = db.query(Payment).filter(Payment.order_id == order_id).first()
-    return payment
-
-
-@app.patch("/payments/{payment_id}/status", response_model=PaymentRead)
-def update_payment_status(
-    payment_id: int,
-    payload: PaymentStatusUpdate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> Payment:
-    """Update payment status (admin only)."""
-    if not require_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator privileges required",
-        )
-
-    payment = db.query(Payment).filter(Payment.id == payment_id).first()
-    if payment is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Payment not found",
-        )
-
-    # Validate status transition
-    valid_transitions: dict[str, set[str]] = {
-        "PENDING": {"SUCCESS", "FAILED"},
-        "SUCCESS": {"REFUNDED"},
-        "FAILED": {"PENDING", "REFUNDED"},
-        "REFUNDED": set(),  # terminal
-    }
-
-    current = payment.status
-    new_status = payload.status
-
-    if new_status not in valid_transitions.get(current, set()):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status transition from {current} to {new_status}",
-        )
-
-    payment.status = new_status
-    db.add(payment)
-    db.commit()
-    db.refresh(payment)
-    return payment
 
 
 @app.get("/addresses", response_model=list[AddressRead])
@@ -1430,127 +1017,6 @@ def delete_address(
         _ensure_default_after_delete(db, current_user, address_id)
 
     return {"message": "Address deleted successfully"}
-
-
-# ---- Expense Routes ----
-
-@app.post("/expenses", response_model=ExpenseRead)
-def create_expense(
-    payload: ExpenseCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> Expense:
-    """Create an expense. Admin or staff with MANAGE_EXPENSES permission required."""
-    if not (require_admin(current_user) or require_permission(current_user, Permission.MANAGE_EXPENSES)):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator or expense management permission required",
-        )
-
-    expense = Expense(
-        description=payload.description,
-        amount=payload.amount,
-        category=payload.category,
-        recorded_by=current_user.id,
-    )
-    db.add(expense)
-    db.commit()
-    db.refresh(expense)
-    return expense
-
-
-@app.get("/expenses", response_model=list[ExpenseRead])
-def list_expenses(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[Expense]:
-    """List expenses. Admin sees all; users see only their own."""
-    if require_admin(current_user):
-        return db.query(Expense).all()
-
-    return db.query(Expense).filter(Expense.recorded_by == current_user.id).all()
-
-
-@app.get("/expenses/{expense_id}", response_model=ExpenseRead)
-def get_expense(
-    expense_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> Expense:
-    """Retrieve a specific expense."""
-    expense = db.query(Expense).filter(Expense.id == expense_id).first()
-    if expense is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Expense not found",
-        )
-
-    # Non-admin users can only access their own expenses
-    if expense.recorded_by != current_user.id:
-        if not require_admin(current_user):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to access this expense",
-            )
-
-    return expense
-
-
-@app.patch("/expenses/{expense_id}", response_model=ExpenseRead)
-def update_expense(
-    expense_id: int,
-    payload: ExpenseCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> Expense:
-    """Update an expense. Admin-only."""
-    if not require_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator privileges required",
-        )
-
-    expense = db.query(Expense).filter(Expense.id == expense_id).first()
-    if expense is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Expense not found",
-        )
-
-    expense.description = payload.description
-    expense.amount = payload.amount
-    expense.category = payload.category
-    # recorded_by is never changed
-
-    db.add(expense)
-    db.commit()
-    db.refresh(expense)
-    return expense
-
-
-@app.delete("/expenses/{expense_id}")
-def delete_expense(
-    expense_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
-    """Delete an expense. Admin-only."""
-    if not require_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator privileges required",
-        )
-
-    expense = db.query(Expense).filter(Expense.id == expense_id).first()
-    if expense is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Expense not found",
-        )
-
-    db.delete(expense)
-    db.commit()
-    return {"message": "Expense deleted successfully"}
 
 
 @app.patch("/addresses/{address_id}/default", response_model=AddressRead)

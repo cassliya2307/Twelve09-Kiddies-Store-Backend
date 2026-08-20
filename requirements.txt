@@ -6,3 +6,6 @@ python-dotenv
 pydantic-settings
 alembic
 PyJWT
+python-multipart
+Pillow
+cloudinary
