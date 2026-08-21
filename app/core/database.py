@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine
@@ -11,6 +12,21 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def normalize_database_url(url: str) -> str:
+    """Normalize DATABASE_URL to use PyMySQL driver for MySQL connections.
+
+    Converts generic mysql:// URLs to mysql+pymysql:// to ensure SQLAlchemy
+    selects the PyMySQL driver instead of MySQLdb (mysqlclient).
+    """
+    if not url:
+        return url
+
+    parsed = urlparse(url)
+    if parsed.scheme == "mysql":
+        return urlunparse(parsed._replace(scheme="mysql+pymysql"))
+    return url
 
 
 class Settings(BaseSettings):
@@ -41,7 +57,7 @@ class Base(DeclarativeBase):
 
 
 engine = create_engine(
-    settings.DATABASE_URL,
+    normalize_database_url(settings.DATABASE_URL),
     pool_pre_ping=True,
     pool_size=settings.DB_POOL_SIZE,
     max_overflow=settings.DB_MAX_OVERFLOW,

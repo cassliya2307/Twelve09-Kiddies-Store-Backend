@@ -19,10 +19,37 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.auth import hash_password, require_admin, require_permission
-from app.core.database import Base, get_db
+from app.core.database import Base, get_db, normalize_database_url
 from app.main import app
 from app.models import Address, Category, FulfillmentMethod, OrderStatus, Permission, Product, User, UserRole, Expense, Payment
 from app.schemas.payment import PaymentRead
+
+
+def test_normalize_database_url_mysql_to_pymysql():
+    """Test that mysql:// URLs are normalized to mysql+pymysql://"""
+    assert normalize_database_url("mysql://user:pass@host:3306/db") == "mysql+pymysql://user:pass@host:3306/db"
+    assert normalize_database_url("mysql://user:pass@host/db") == "mysql+pymysql://user:pass@host/db"
+    assert normalize_database_url("mysql://user:pass@host:3306/db?charset=utf8mb4") == "mysql+pymysql://user:pass@host:3306/db?charset=utf8mb4"
+
+
+def test_normalize_database_url_pymysql_unchanged():
+    """Test that mysql+pymysql:// URLs are left unchanged"""
+    assert normalize_database_url("mysql+pymysql://user:pass@host:3306/db") == "mysql+pymysql://user:pass@host:3306/db"
+    assert normalize_database_url("mysql+pymysql://user:pass@host/db?charset=utf8mb4") == "mysql+pymysql://user:pass@host/db?charset=utf8mb4"
+
+
+def test_normalize_database_url_other_schemes_unchanged():
+    """Test that non-MySQL URLs are left unchanged"""
+    assert normalize_database_url("postgresql://user:pass@host/db") == "postgresql://user:pass@host/db"
+    assert normalize_database_url("sqlite:///test.db") == "sqlite:///test.db"
+    assert normalize_database_url("sqlite://") == "sqlite://"
+    assert normalize_database_url("postgresql+psycopg2://user:pass@host/db") == "postgresql+psycopg2://user:pass@host/db"
+
+
+def test_normalize_database_url_empty_and_none():
+    """Test edge cases with empty/None URLs"""
+    assert normalize_database_url("") == ""
+    assert normalize_database_url(None) is None
 
 
 @pytest.fixture
