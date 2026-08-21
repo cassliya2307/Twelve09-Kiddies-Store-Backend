@@ -9,3 +9,4 @@ PyJWT
 python-multipart
 Pillow
 cloudinary
+email-validator
