@@ -7,7 +7,7 @@ from sqlalchemy import engine_from_config, pool
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
-from app.core.database import Base, settings
+from app.core.database import Base, settings, normalize_database_url
 from app.models import *  # noqa: F401,F403
 
 
@@ -15,7 +15,7 @@ config = context.config
 
 config.set_main_option(
     "sqlalchemy.url",
-    settings.DATABASE_URL.replace("%", "%%")
+    normalize_database_url(settings.DATABASE_URL).replace("%", "%%")
 )
 
 target_metadata = Base.metadata
