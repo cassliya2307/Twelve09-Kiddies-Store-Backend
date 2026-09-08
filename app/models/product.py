@@ -11,13 +11,17 @@ from app.core.database import Base, utcnow
 
 class Product(Base):
     __tablename__ = "products"
-    __table_args__ = (CheckConstraint("stock_quantity >= 0", name="ck_products_stock_quantity_non_negative"),)
+    __table_args__ = (
+        CheckConstraint("stock_quantity >= 0", name="ck_products_stock_quantity_non_negative"),
+        CheckConstraint("cost_price IS NULL OR cost_price >= 0", name="ck_products_cost_price_non_negative"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     category_id: Mapped[int] = mapped_column(ForeignKey("categories.id"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(150), nullable=False, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     price: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), nullable=False)
+    cost_price: Mapped[Decimal | None] = mapped_column(DECIMAL(10, 2), nullable=True)
     stock_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)

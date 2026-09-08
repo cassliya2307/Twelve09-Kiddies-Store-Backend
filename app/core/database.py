@@ -29,6 +29,14 @@ def normalize_database_url(url: str) -> str:
     return url
 
 
+def _sqlite_connect_args(url: str) -> dict:
+    """Return SQLite-specific connect args; empty dict for non-SQLite URLs."""
+    parsed = urlparse(url)
+    if parsed.scheme in ("sqlite", "sqlite_async"):
+        return {"check_same_thread": False}
+    return {}
+
+
 class Settings(BaseSettings):
     DATABASE_URL: str
     SECRET_KEY: str
@@ -39,6 +47,9 @@ class Settings(BaseSettings):
     CLOUDINARY_CLOUD_NAME: str = ""
     CLOUDINARY_API_KEY: str = ""
     CLOUDINARY_API_SECRET: str = ""
+    PAYSTACK_SECRET_KEY: str = ""
+    PAYSTACK_PUBLIC_KEY: str = ""
+    PAYSTACK_WEBHOOK_SECRET: str = ""
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10
     DB_POOL_RECYCLE: int = 3600
@@ -52,17 +63,40 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def _engine_kwargs(database_url: str) -> dict:
+    """Build engine keyword arguments conditional on the database dialect.
+
+    MySQL-specific pool parameters (pool_size, max_overflow, pool_recycle,
+    pool_timeout) are omitted for SQLite to avoid compatibility issues and
+    test-harness timeouts.
+    """
+    parsed = urlparse(database_url)
+    scheme = (parsed.scheme or "").lower()
+    kwargs = {
+        "pool_pre_ping": True,
+    }
+    if scheme == "sqlite":
+        kwargs["poolclass"] = StaticPool
+        kwargs["connect_args"] = _sqlite_connect_args(database_url)
+    else:
+        kwargs.update(
+            {
+                "pool_size": settings.DB_POOL_SIZE,
+                "max_overflow": settings.DB_MAX_OVERFLOW,
+                "pool_recycle": settings.DB_POOL_RECYCLE,
+                "pool_timeout": settings.DB_POOL_TIMEOUT,
+            }
+        )
+    return kwargs
+
+
 class Base(DeclarativeBase):
     pass
 
 
 engine = create_engine(
     normalize_database_url(settings.DATABASE_URL),
-    pool_pre_ping=True,
-    pool_size=settings.DB_POOL_SIZE,
-    max_overflow=settings.DB_MAX_OVERFLOW,
-    pool_recycle=settings.DB_POOL_RECYCLE,
-    pool_timeout=settings.DB_POOL_TIMEOUT,
+    **_engine_kwargs(settings.DATABASE_URL),
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

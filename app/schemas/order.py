@@ -33,6 +33,7 @@ class OrderItemRead(BaseModel):
     quantity: int
     unit_price: float
     subtotal: float
+    image_url: str | None = None
 
     class Config:
         from_attributes = True

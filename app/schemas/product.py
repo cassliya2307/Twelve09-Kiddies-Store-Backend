@@ -27,6 +27,7 @@ class ProductBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=150)
     description: str | None = Field(default=None, max_length=2000)
     price: Decimal = Field(..., gt=0, decimal_places=2)
+    cost_price: Decimal | None = Field(default=None, ge=0, decimal_places=2)
     category_id: int
     image_url: str | None = Field(default=None, max_length=500)
 
@@ -41,6 +42,7 @@ class ProductUpdate(BaseModel):
     category_id: int | None = None
     image_url: str | None = Field(default=None, max_length=500)
     price: Decimal | None = Field(default=None, gt=0, decimal_places=2)
+    cost_price: Decimal | None = Field(default=None, ge=0, decimal_places=2)
 
 
 class StockUpdate(BaseModel):
@@ -65,6 +67,7 @@ class ProductListRead(BaseModel):
     name: str
     description: str | None = None
     price: Decimal
+    cost_price: Decimal | None = None
     image_url: str | None = None
     is_active: bool = True
     category_id: int

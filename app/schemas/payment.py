@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 from decimal import Decimal
 from datetime import datetime
+from typing import Optional
 
 
 class PaymentCreate(BaseModel):
@@ -11,6 +12,9 @@ class PaymentCreate(BaseModel):
     transaction_reference: str | None = Field(
         default=None, max_length=255, description="External payment provider transaction reference"
     )
+    provider: str | None = Field(default=None, max_length=50, description="Payment provider (e.g., paystack)")
+    provider_reference: str | None = Field(default=None, max_length=255, description="Provider transaction reference")
+    payment_metadata: Optional[dict] = Field(default=None, description="Additional payment metadata")
 
 
 class PaymentRead(BaseModel):
@@ -19,7 +23,12 @@ class PaymentRead(BaseModel):
     amount: Decimal
     status: str
     payment_method: str
-    transaction_reference: str | None = None
+    provider: Optional[str] = None
+    provider_reference: Optional[str] = None
+    transaction_reference: Optional[str] = None
+    payment_metadata: Optional[dict] = None
+    currency: Optional[str] = None
+    paid_at: Optional[datetime] = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

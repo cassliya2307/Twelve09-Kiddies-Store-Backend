@@ -21,7 +21,7 @@ from sqlalchemy.pool import StaticPool
 from app.core.auth import hash_password, require_admin, require_permission
 from app.core.database import Base, get_db, normalize_database_url
 from app.main import app
-from app.models import Address, Category, FulfillmentMethod, OrderStatus, Permission, Product, User, UserRole, Expense, Payment
+from app.models import Address, Category, FulfillmentMethod, Order, OrderStatus, Permission, Product, User, UserRole, Expense, Payment
 from app.schemas.payment import PaymentRead
 
 
@@ -1535,7 +1535,7 @@ def test_payment_duplicate_prevention(client):
     assert payment_response.status_code == 409, payment_response.text
 
 
-def test_payment_admin_access(client):
+def test_payment_status_valid_transitions(client):
     """Test valid payment status transitions."""
     from app.core.auth import hash_password
     import pytest
@@ -2494,5 +2494,747 @@ def test_upload_path_traversal_contained(client, cloudinary_mock):
     assert ".." not in filename
     assert filename.startswith("twelve09/products/")
     assert re.fullmatch(r"twelve09/products/\d+/[a-z0-9-]+(\.png)?", filename)
+
+
+# ============================================================
+# ANALYTICS TESTS
+# ============================================================
+
+from app.services import analytics
+from app.models import OrderStatus, PaymentStatus, Permission
+from decimal import Decimal
+
+
+def _create_completed_order_with_payment(client, headers, product, quantity=1, payment_status=PaymentStatus.SUCCESS):
+    """Helper to create a completed order with payment."""
+    # Create address
+    address = client.post(
+        "/addresses",
+        headers=headers,
+        json={
+            "recipient_name": "Test User",
+            "phone_number": "08012345678",
+            "address_line": "123 Test St",
+            "city": "Lagos",
+            "state": "Lagos",
+        },
+    )
+    assert address.status_code == 200, address.text
+    address_id = address.json()["id"]
+
+    # Create order
+    order = client.post(
+        "/orders",
+        headers=headers,
+        json={
+            "fulfillment_method": "STORE_PICKUP",
+            "address_id": address_id,
+            "items": [{"product_id": product.id, "quantity": quantity}],
+        },
+    )
+    assert order.status_code == 200, order.text
+    order_data = order.json()
+    order_id = order_data["id"]
+
+    # Complete the order through proper status transitions (admin only)
+    admin = _get_admin_headers(client)
+    
+    # PENDING -> CONFIRMED
+    complete = client.patch(
+        f"/orders/{order_id}/status",
+        headers=admin,
+        json={"status": "CONFIRMED"},
+    )
+    assert complete.status_code == 200, complete.text
+
+    # CONFIRMED -> PROCESSING
+    complete = client.patch(
+        f"/orders/{order_id}/status",
+        headers=admin,
+        json={"status": "PROCESSING"},
+    )
+    assert complete.status_code == 200, complete.text
+
+    # PROCESSING -> READY_FOR_PICKUP
+    complete = client.patch(
+        f"/orders/{order_id}/status",
+        headers=admin,
+        json={"status": "READY_FOR_PICKUP"},
+    )
+    assert complete.status_code == 200, complete.text
+
+    # READY_FOR_PICKUP -> COMPLETED
+    complete = client.patch(
+        f"/orders/{order_id}/status",
+        headers=admin,
+        json={"status": "COMPLETED"},
+    )
+    assert complete.status_code == 200, complete.text
+
+    # Create payment
+    payment = client.post(
+        "/payments",
+        headers=headers,
+        json={
+            "order_id": order_id,
+            "payment_method": "STRIPE",
+            "transaction_reference": f"ref_{order_id}",
+        },
+    )
+    assert payment.status_code == 200, payment.text
+    payment_id = payment.json()["id"]
+
+    # Update payment status - need to go through valid transitions
+    # For REFUNDED, must go PENDING -> SUCCESS -> REFUNDED
+    if payment_status == PaymentStatus.REFUNDED:
+        # First set to SUCCESS
+        update = client.patch(
+            f"/payments/{payment_id}/status",
+            headers=admin,
+            json={"status": "SUCCESS"},
+        )
+        assert update.status_code == 200, update.text
+        # Then set to REFUNDED
+        update = client.patch(
+            f"/payments/{payment_id}/status",
+            headers=admin,
+            json={"status": "REFUNDED"},
+        )
+        assert update.status_code == 200, update.text
+    else:
+        update = client.patch(
+            f"/payments/{payment_id}/status",
+            headers=admin,
+            json={"status": payment_status.value},
+        )
+        assert update.status_code == 200, update.text
+
+    return order_id
+
+
+def test_analytics_no_orders(client):
+    """Test analytics with no orders."""
+    admin = _get_admin_headers(client)
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        kpi = analytics.get_kpi_summary(db, days=30)
+        assert kpi["total_revenue"] == Decimal("0")
+        assert kpi["total_orders"] == 0
+        assert kpi["net_revenue"] == Decimal("0")
+        assert kpi["profit_proxy"] == Decimal("0")
+    finally:
+        db.close()
+
+
+def test_analytics_completed_orders(client):
+    """Test analytics with completed orders."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust1@example.com", "pass123456")
+
+    # Create product
+    product = _create_product(client, "Analytics Product", price=100.00, stock=10)
+
+    # Create completed order
+    _create_completed_order_with_payment(client, customer, product, quantity=2)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        kpi = analytics.get_kpi_summary(db, days=30)
+        assert kpi["total_orders"] == 1
+        assert kpi["total_revenue"] == Decimal("200.00")
+        assert kpi["net_revenue"] == Decimal("200.00")
+    finally:
+        db.close()
+
+
+def test_analytics_pending_orders_excluded(client):
+    """Test that pending orders are excluded from revenue."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust2@example.com", "pass123456")
+    product = _create_product(client, "Pending Product", price=100.00, stock=10)
+
+    # Create order but don't complete it
+    address = client.post(
+        "/addresses",
+        headers=customer,
+        json={
+            "recipient_name": "Test User",
+            "phone_number": "08012345678",
+            "address_line": "123 Test St",
+            "city": "Lagos",
+            "state": "Lagos",
+        },
+    )
+    address_id = address.json()["id"]
+
+    order = client.post(
+        "/orders",
+        headers=customer,
+        json={
+            "fulfillment_method": "STORE_PICKUP",
+            "address_id": address_id,
+            "items": [{"product_id": product.id, "quantity": 1}],
+        },
+    )
+    assert order.status_code == 200
+    order_id = order.json()["id"]
+
+    # Don't complete the order - leave as PENDING
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        kpi = analytics.get_kpi_summary(db, days=30)
+        assert kpi["total_orders"] == 0
+        assert kpi["total_revenue"] == Decimal("0")
+    finally:
+        db.close()
+
+
+def test_analytics_cancelled_orders_excluded(client):
+    """Test that cancelled orders are excluded from revenue."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust3@example.com", "pass123456")
+    product = _create_product(client, "Cancelled Product", price=100.00, stock=10)
+
+    address = client.post(
+        "/addresses",
+        headers=customer,
+        json={
+            "recipient_name": "Test User",
+            "phone_number": "08012345678",
+            "address_line": "123 Test St",
+            "city": "Lagos",
+            "state": "Lagos",
+        },
+    )
+    address_id = address.json()["id"]
+
+    order = client.post(
+        "/orders",
+        headers=customer,
+        json={
+            "fulfillment_method": "STORE_PICKUP",
+            "address_id": address_id,
+            "items": [{"product_id": product.id, "quantity": 1}],
+        },
+    )
+    assert order.status_code == 200
+    order_id = order.json()["id"]
+
+    # Cancel the order
+    cancel = client.patch(
+        f"/orders/{order_id}/status",
+        headers=admin,
+        json={"status": "CANCELLED"},
+    )
+    assert cancel.status_code == 200
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        kpi = analytics.get_kpi_summary(db, days=30)
+        assert kpi["total_orders"] == 0
+        assert kpi["total_revenue"] == Decimal("0")
+    finally:
+        db.close()
+
+
+def test_analytics_successful_payments(client):
+    """Test analytics with successful payments."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust4@example.com", "pass123456")
+    product = _create_product(client, "Success Product", price=150.00, stock=10)
+
+    _create_completed_order_with_payment(client, customer, product, quantity=1, payment_status=PaymentStatus.SUCCESS)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        kpi = analytics.get_kpi_summary(db, days=30)
+        assert kpi["total_revenue"] == Decimal("150.00")
+        assert kpi["total_refunds"] == Decimal("0")
+    finally:
+        db.close()
+
+
+def test_analytics_refunded_payments(client):
+    """Test that refunded payments are tracked and deducted."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust5@example.com", "pass123456")
+    product = _create_product(client, "Refund Product", price=200.00, stock=10)
+
+    _create_completed_order_with_payment(client, customer, product, quantity=1, payment_status=PaymentStatus.REFUNDED)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        kpi = analytics.get_kpi_summary(db, days=30)
+        assert kpi["total_revenue"] == Decimal("200.00")
+        assert kpi["total_refunds"] == Decimal("200.00")
+        assert kpi["net_revenue"] == Decimal("0")
+    finally:
+        db.close()
+
+
+def test_analytics_expenses(client):
+    """Test expense tracking."""
+    admin = _get_admin_headers(client)
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        # Create expense
+        expense = Expense(
+            recorded_by=1,
+            description="Test expense",
+            amount=Decimal("50.00"),
+            category="Marketing",
+        )
+        db.add(expense)
+        db.commit()
+
+        kpi = analytics.get_kpi_summary(db, days=30)
+        assert kpi["total_expenses"] == Decimal("50.00")
+    finally:
+        db.close()
+
+
+def test_analytics_profit_proxy(client):
+    """Test profit proxy calculation (net revenue - expenses)."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust6@example.com", "pass123456")
+    product = _create_product(client, "Profit Product", price=300.00, stock=10)
+
+    _create_completed_order_with_payment(client, customer, product, quantity=1, payment_status=PaymentStatus.SUCCESS)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        # Add expense
+        expense = Expense(
+            recorded_by=1,
+            description="Test expense",
+            amount=Decimal("50.00"),
+            category="Marketing",
+        )
+        db.add(expense)
+        db.commit()
+
+        kpi = analytics.get_kpi_summary(db, days=30)
+        assert kpi["net_revenue"] == Decimal("300.00")
+        assert kpi["total_expenses"] == Decimal("50.00")
+        assert kpi["profit_proxy"] == Decimal("250.00")
+    finally:
+        db.close()
+
+
+def test_analytics_products_with_known_cost_price(client):
+    """Test products with known cost_price."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust7@example.com", "pass123456")
+    product = _create_product(client, "Cost Price Product", price=100.00, stock=10)
+
+    # Update product with cost_price
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        db_product = db.query(Product).filter(Product.id == product.id).first()
+        db_product.cost_price = Decimal("40.00")
+        db.commit()
+    finally:
+        db.close()
+
+    _create_completed_order_with_payment(client, customer, product, quantity=5, payment_status=PaymentStatus.SUCCESS)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        cogs = analytics.get_cogs(db, days=30)
+        assert cogs == Decimal("200.00")  # 5 * 40
+    finally:
+        db.close()
+
+
+def test_analytics_products_with_null_cost_price(client):
+    """Test that NULL cost_price is handled correctly (not treated as zero)."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust8@example.com", "pass123456")
+    product = _create_product(client, "Null Cost Product", price=100.00, stock=10)
+
+    _create_completed_order_with_payment(client, customer, product, quantity=10, payment_status=PaymentStatus.SUCCESS)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        cogs = analytics.get_cogs(db, days=30)
+        assert cogs == Decimal("0")  # NULL cost_price excluded from COGS
+    finally:
+        db.close()
+
+
+def test_analytics_cogs_calculation(client):
+    """Test COGS calculation with multiple products."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust9@example.com", "pass123456")
+
+    # Create two products with different cost prices
+    product1 = _create_product(client, "Product A", price=100.00, stock=100)
+    product2 = _create_product(client, "Product B", price=200.00, stock=50)
+
+    # Update cost prices
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        db_p1 = db.query(Product).filter(Product.id == product1.id).first()
+        db_p2 = db.query(Product).filter(Product.id == product2.id).first()
+        db_p1.cost_price = Decimal("30.00")
+        db_p2.cost_price = Decimal("80.00")
+        db.commit()
+    finally:
+        db.close()
+
+    # Order 3 of product A
+    _create_completed_order_with_payment(client, customer, product1, quantity=3, payment_status=PaymentStatus.SUCCESS)
+    # Order 2 of product B
+    _create_completed_order_with_payment(client, customer, product2, quantity=2, payment_status=PaymentStatus.SUCCESS)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        cogs = analytics.get_cogs(db, days=30)
+        assert cogs == Decimal("250.00")  # 3*30 + 2*80 = 90 + 160 = 250
+    finally:
+        db.close()
+
+
+def test_analytics_gross_profit_calculation(client):
+    """Test gross profit calculation."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust10@example.com", "pass123456")
+    product = _create_product(client, "Gross Profit Product", price=100.00, stock=10)
+
+    # Update product with cost_price
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        db_product = db.query(Product).filter(Product.id == product.id).first()
+        db_product.cost_price = Decimal("25.00")
+        db.commit()
+    finally:
+        db.close()
+
+    # Sell 4 units at 100 each = 400 revenue, cost = 4*25 = 100
+    _create_completed_order_with_payment(client, customer, product, quantity=4, payment_status=PaymentStatus.SUCCESS)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        gross = analytics.get_gross_profit(db, days=30)
+        assert gross["net_revenue"] == Decimal("400.00")
+        assert gross["cogs"] == Decimal("100.00")
+        assert gross["gross_profit"] == Decimal("300.00")
+        assert gross["gross_margin_percent"] == 75.0
+    finally:
+        db.close()
+
+
+def test_analytics_inventory_retail_valuation(client):
+    """Test inventory retail valuation."""
+    admin = _get_admin_headers(client)
+    # Create a product
+    _create_product(client, "Inventory Product 1", price=100.00, stock=5)
+    _create_product(client, "Inventory Product 2", price=200.00, stock=3)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        inv = analytics.get_inventory_snapshot(db)
+        total_retail = sum(item["retail_value"] for item in inv)
+        # Should equal sum of price * stock for all active products
+        expected = sum(p.price * p.stock_quantity for p in db.query(Product).filter(Product.is_active == True).all())
+        assert total_retail == expected
+    finally:
+        db.close()
+
+
+def test_analytics_inventory_cost_valuation(client):
+    """Test inventory cost valuation only where cost_price known."""
+    admin = _get_admin_headers(client)
+    product = _create_product(client, "Cost Valuation Product", price=100.00, stock=5)
+
+    # Set cost_price on one product
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        db_product = db.query(Product).filter(Product.id == product.id).first()
+        db_product.cost_price = Decimal("10.00")
+        db.commit()
+        db.refresh(db_product)
+    finally:
+        db.close()
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        inv = analytics.get_inventory_snapshot(db)
+        # Find the item with cost_value
+        item = next(i for i in inv if i["product_id"] == product.id)
+        assert item["cost_value"] == Decimal("10.00") * item["stock_quantity"]
+    finally:
+        db.close()
+
+
+def test_analytics_top_selling_products(client):
+    """Test top selling products ranking."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust11@example.com", "pass123456")
+    # Create two products
+    p1 = _create_product(client, "Top Seller", price=100.00, stock=100)
+    p2 = _create_product(client, "Low Seller", price=200.00, stock=100)
+
+    # Sell 10 of p1 (revenue 1000)
+    _create_completed_order_with_payment(client, customer, p1, quantity=10, payment_status=PaymentStatus.SUCCESS)
+    # Sell 2 of p2 (revenue 400)
+    _create_completed_order_with_payment(client, customer, p2, quantity=2, payment_status=PaymentStatus.SUCCESS)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        top = analytics.get_top_products(db, limit=5, days=30)
+        assert len(top) == 2
+        assert top[0]["product_id"] == p1.id
+        assert top[0]["total_revenue"] == Decimal("1000.00")
+        assert top[1]["product_id"] == p2.id
+        assert top[1]["total_revenue"] == Decimal("400.00")
+    finally:
+        db.close()
+
+
+def test_analytics_category_performance(client):
+    """Test category performance."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust12@example.com", "pass123456")
+
+    # Ensure Test Category exists
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        cat1 = db.query(Category).filter(Category.name == "Test Category").first()
+        if cat1 is None:
+            cat1 = Category(name="Test Category", description="Test category")
+            db.add(cat1)
+            db.commit()
+            db.refresh(cat1)
+        cat1_id = cat1.id
+        
+        cat2 = Category(name="Cat2", description="", is_active=True)
+        db.add(cat2)
+        db.commit()
+        db.refresh(cat2)
+        cat2_id = cat2.id
+    finally:
+        db.close()
+
+    # Create products in different categories
+    p1 = _create_product(client, "P1", price=100.00, stock=100)
+    p2 = _create_product(client, "P2", price=200.00, stock=100)
+
+    # Assign p2 to cat2
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        db_p2 = db.query(Product).filter(Product.id == p2.id).first()
+        db_p2.category_id = cat2_id
+        db.commit()
+    finally:
+        db.close()
+
+    _create_completed_order_with_payment(client, customer, p1, quantity=5, payment_status=PaymentStatus.SUCCESS)
+    _create_completed_order_with_payment(client, customer, p2, quantity=2, payment_status=PaymentStatus.SUCCESS)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        cats = analytics.get_category_performance(db, days=30)
+        assert len(cats) == 2
+        # Sort by revenue to ensure correct order
+        cats_by_revenue = {c["category_id"]: c["total_revenue"] for c in cats}
+        assert cats_by_revenue[cat1_id] == Decimal("500.00")
+        assert cats_by_revenue[cat2_id] == Decimal("400.00")
+    finally:
+        db.close()
+
+
+def test_analytics_order_status_distribution(client):
+    """Test order status distribution."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust_dist@example.com", "pass123456")
+    product = _create_product(client, "Dist Product", price=100.00, stock=10)
+
+    # Create a pending order (don't complete it)
+    address = client.post(
+        "/addresses",
+        headers=customer,
+        json={"recipient_name": "Test", "phone_number": "08011111111", "address_line": "123 Main St", "city": "Lagos", "state": "Lagos"},
+    )
+    assert address.status_code == 200, address.text
+    address_id = address.json()["id"]
+    order = client.post("/orders", headers=customer, json={"fulfillment_method": "STORE_PICKUP", "address_id": address_id, "items": [{"product_id": product.id, "quantity": 1}]})
+    assert order.status_code == 200
+
+    # Create a completed order
+    _create_completed_order_with_payment(client, customer, product, quantity=1, payment_status=PaymentStatus.SUCCESS)
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        dist = analytics.get_order_status_distribution(db)
+        statuses = {d["status"] for d in dist}
+        assert "PENDING" in statuses
+        assert "COMPLETED" in statuses
+        # Count should match actual orders
+        total_count = sum(d["count"] for d in dist)
+        actual_count = db.query(Order).count()
+        assert total_count == actual_count
+    finally:
+        db.close()
+
+
+def test_analytics_payment_method_distribution(client):
+    """Test payment method distribution."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust13@example.com", "pass123456")
+    product = _create_product(client, "Pay Dist Product", price=100.00, stock=10)
+
+    # Create two orders with different payment methods
+    order1_id = _create_completed_order_with_payment(client, customer, product, quantity=1, payment_status=PaymentStatus.SUCCESS)
+    
+    # Create second order manually with PAYSTACK
+    address = client.post(
+        "/addresses",
+        headers=customer,
+        json={"recipient_name": "Test", "phone_number": "08011111111", "address_line": "123 Main St", "city": "Lagos", "state": "Lagos"},
+    )
+    assert address.status_code == 200, address.text
+    address_id = address.json()["id"]
+    order2 = client.post("/orders", headers=customer, json={"fulfillment_method": "STORE_PICKUP", "address_id": address_id, "items": [{"product_id": product.id, "quantity": 1}]})
+    assert order2.status_code == 200, order2.text
+    order2_id = order2.json()["id"]
+    
+    # Complete second order
+    complete = client.patch(f"/orders/{order2_id}/status", headers=admin, json={"status": "CONFIRMED"})
+    assert complete.status_code == 200, complete.text
+    complete = client.patch(f"/orders/{order2_id}/status", headers=admin, json={"status": "PROCESSING"})
+    assert complete.status_code == 200, complete.text
+    complete = client.patch(f"/orders/{order2_id}/status", headers=admin, json={"status": "READY_FOR_PICKUP"})
+    assert complete.status_code == 200, complete.text
+    complete = client.patch(f"/orders/{order2_id}/status", headers=admin, json={"status": "COMPLETED"})
+    assert complete.status_code == 200, complete.text
+    
+    payment2 = client.post("/payments", headers=customer, json={"order_id": order2_id, "payment_method": "PAYSTACK", "transaction_reference": "ref2"})
+    assert payment2.status_code == 200, payment2.text
+    payment2_id = payment2.json()["id"]
+    client.patch(f"/payments/{payment2_id}/status", headers=admin, json={"status": "SUCCESS"})
+
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        dist = analytics.get_payment_distribution(db, days=30)
+        methods = {d["method"] for d in dist}
+        assert "STRIPE" in methods
+        assert "PAYSTACK" in methods
+        for d in dist:
+            assert d["success_rate"] >= 0
+    finally:
+        db.close()
+
+
+def test_analytics_date_filtering(client):
+    """Test date filtering on analytics."""
+    admin = _get_admin_headers(client)
+    customer = _register_and_login(client, "cust14@example.com", "pass123456")
+    product = _create_product(client, "Date Filter Product", price=100.00, stock=10)
+    _create_completed_order_with_payment(client, customer, product, quantity=1, payment_status=PaymentStatus.SUCCESS)
+
+    # Test with start_date in future (should exclude order)
+    from datetime import date, timedelta
+    future = date.today() + timedelta(days=10)
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        kpi = analytics.get_kpi_summary(db, start_date=future)
+        assert kpi["total_orders"] == 0
+
+        # Test with start_date in past (should include order)
+        past = date.today() - timedelta(days=10)
+        kpi = analytics.get_kpi_summary(db, start_date=past)
+        assert kpi["total_orders"] == 1
+    finally:
+        db.close()
+
+
+def test_analytics_authorization_with_permission(client):
+    """Test that users with VIEW_REPORTS can access analytics."""
+    # Create staff with VIEW_REPORTS permission
+    admin = _get_admin_headers(client)
+    engine = app.state.test_engine
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+    try:
+        from app.core.auth import hash_password
+        from app.models import User, UserRole
+        staff = User(
+            name="Staff Reports",
+            email="staffreports@example.com",
+            password_hash=hash_password("pass123456"),
+            role=UserRole.STAFF,
+            permissions=[Permission.VIEW_REPORTS.value],
+            is_active=True,
+        )
+        db.add(staff)
+        db.commit()
+        db.refresh(staff)
+        staff_id = staff.id
+    finally:
+        db.close()
+
+    # Login as staff
+    login = client.post("/auth/login", json={"email": "staffreports@example.com", "password": "pass123456"})
+    assert login.status_code == 200, login.text
+    staff_token = login.json()["access_token"]
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+
+    # Should be able to access analytics
+    response = client.get("/admin/dashboard/kpis", headers=staff_headers)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert "total_revenue" in data
 
 

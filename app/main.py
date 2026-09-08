@@ -1,13 +1,15 @@
 from contextlib import asynccontextmanager
-from datetime import timezone
+from datetime import datetime, timezone
+import json
 import logging
 import sys
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from decimal import Decimal
 from pathlib import Path
@@ -20,6 +22,7 @@ from app.core.auth import (
     require_permission,
     verify_password,
 )
+from app.services.paystack import paystack_client, PaystackError, PaystackVerificationError
 from app.core.database import get_db, settings
 from app.models import (
     Address,
@@ -62,6 +65,8 @@ from app.schemas.product_image import (
     ProductImageUploadResponse,
 )
 from app.schemas.user import UserCreate, UserRead, UserUpdate
+
+
 from app.services.product_image import (
     destroy_cloudinary_image,
     extract_our_public_id,
@@ -69,6 +74,7 @@ from app.services.product_image import (
     upload_to_cloudinary,
     _validate_and_prepare_upload,
 )
+from app.api.admin_dashboard import router as admin_dashboard_router
 
 
 logging.basicConfig(
@@ -113,6 +119,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(admin_dashboard_router)
 
 
 def _get_user_address_for_update(db: Session, current_user: User, address_id: int) -> Address | None:
@@ -266,6 +274,45 @@ def get_authenticated_user(current_user: User = Depends(get_current_user)) -> Us
     return current_user
 
 
+@app.get("/admin/users", response_model=list[UserRead])
+def list_users(
+    role: UserRole | None = None,
+    is_active: bool | None = None,
+    search: str | None = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[User]:
+    if not require_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator privileges required",
+        )
+
+    query = db.query(User)
+    if role is not None:
+        query = query.filter(User.role == role)
+    if is_active is not None:
+        query = query.filter(User.is_active == is_active)
+    if search is not None:
+        trimmed = search.strip()
+        if trimmed:
+            if len(trimmed) > 100:
+                trimmed = trimmed[:100]
+            escaped = trimmed.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            from sqlalchemy import or_
+
+            query = query.filter(
+                or_(
+                    User.name.ilike(pattern, escape="\\"),
+                    User.email.ilike(pattern, escape="\\"),
+                )
+            )
+    return query.order_by(User.created_at.desc()).offset(skip).limit(limit).all()
+
+
 @app.patch("/admin/users/{user_id}/permissions", response_model=UserRead)
 def update_user_permissions(
     user_id: int,
@@ -355,11 +402,28 @@ def list_products(
     skip: int = 0,
     limit: int = 100,
     include_inactive: bool = False,
+    search: str | None = None,
     db: Session = Depends(get_db),
 ):
+    from sqlalchemy import or_
+
     query = db.query(Product)
     if not include_inactive:
         query = query.filter(Product.is_active == True)
+    if search is not None:
+        trimmed = search.strip()
+        if trimmed:
+            # Limit length to prevent abuse; truncate safely
+            if len(trimmed) > 100:
+                trimmed = trimmed[:100]
+            escaped = trimmed.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            query = query.filter(
+                or_(
+                    Product.name.ilike(pattern, escape="\\"),
+                    Product.description.ilike(pattern, escape="\\"),
+                )
+            )
     return query.order_by(Product.created_at.desc()).offset(skip).limit(limit).all()
 
 
@@ -803,6 +867,29 @@ def _validate_order_status_transition(current_status: OrderStatus, new_status: O
         )
 
 
+def _restore_stock_for_cancelled_order(db: Session, order: Order) -> None:
+    """Restore product stock for a cancelled order atomically.
+
+    Must be called within the same transaction that sets order.status to CANCELLED
+    and with the order row already locked via with_for_update.
+    """
+    if not order.order_items:
+        return
+    product_ids = [item.product_id for item in order.order_items]
+    products = (
+        db.query(Product)
+        .filter(Product.id.in_(product_ids))
+        .with_for_update()
+        .all()
+    )
+    product_map = {p.id: p for p in products}
+    for item in order.order_items:
+        product = product_map.get(item.product_id)
+        if product is not None:
+            product.stock_quantity = product.stock_quantity + item.quantity
+            db.add(product)
+
+
 def _serialize_order_for_response(order: Order) -> Order:
     if not hasattr(order, "subtotal"):
         order.subtotal = sum(
@@ -973,16 +1060,62 @@ def update_order_status(
             detail="Order management permission required",
         )
 
-    order = db.query(Order).filter(Order.id == order_id).first()
+    order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    # Idempotent: already in target status → no stock change, return as-is
+    if order.status == payload.status:
+        order.subtotal = sum((Decimal(str(item.subtotal)) for item in order.order_items), Decimal("0.00"))
+        return order
 
     try:
         _validate_order_status_transition(order.status, payload.status, order.fulfillment_method)
     except HTTPException:
         raise
 
+    is_cancelling = payload.status == OrderStatus.CANCELLED and order.status != OrderStatus.CANCELLED
+    if is_cancelling:
+        _restore_stock_for_cancelled_order(db, order)
+
     order.status = payload.status
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    order.subtotal = sum((Decimal(str(item.subtotal)) for item in order.order_items), Decimal("0.00"))
+    return order
+
+
+@app.post("/orders/{order_id}/cancel", response_model=OrderRead)
+def cancel_order(
+    order_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Order:
+    order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
+    if order is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    # Ownership check: customer may cancel own order, admin/staff with permission may cancel any
+    if order.user_id != current_user.id:
+        if not (require_admin(current_user) or require_permission(current_user, Permission.MANAGE_ORDERS)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to cancel this order",
+            )
+
+    # Idempotent: already cancelled → return without double-restoring stock
+    if order.status == OrderStatus.CANCELLED:
+        order.subtotal = sum((Decimal(str(item.subtotal)) for item in order.order_items), Decimal("0.00"))
+        return order
+
+    try:
+        _validate_order_status_transition(order.status, OrderStatus.CANCELLED, order.fulfillment_method)
+    except HTTPException:
+        raise
+
+    _restore_stock_for_cancelled_order(db, order)
+    order.status = OrderStatus.CANCELLED
     db.add(order)
     db.commit()
     db.refresh(order)
@@ -1324,6 +1457,286 @@ def update_payment_status(
     db.commit()
     db.refresh(payment)
     return payment
+
+
+# ---- Paystack Payment Routes ----
+
+class PaystackInitializeRequest(BaseModel):
+    order_id: int
+    callback_url: str | None = None
+
+
+@app.post("/payments/paystack/initialize")
+async def initialize_paystack_payment(
+    payload: PaystackInitializeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Initialize a Paystack transaction for an order."""
+    # Validate order exists. Lock the order row so concurrent initialize
+    # requests for the same order are serialized (prevents duplicate payments).
+    order = db.query(Order).filter(Order.id == payload.order_id).with_for_update().first()
+    if order is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Order not found",
+        )
+
+    # Check ownership
+    if order.user_id != current_user.id:
+        if not require_admin(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to pay for this order",
+            )
+
+    # Check if order is payable (PENDING status)
+    if order.status != OrderStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Order is not in a payable state",
+        )
+
+    # Check if payment already exists and is successful
+    existing_payment = db.query(Payment).filter(Payment.order_id == order.id).first()
+    if existing_payment and existing_payment.status == PaymentStatus.SUCCESS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Order has already been paid",
+        )
+
+    # If there's a failed payment, we can retry by creating a new payment record
+    # or reuse the failed payment record
+    if existing_payment and existing_payment.status == PaymentStatus.FAILED:
+        # We'll reuse the existing failed payment record
+        payment = existing_payment
+    elif existing_payment and existing_payment.status == PaymentStatus.PENDING:
+        # Reuse pending payment
+        payment = existing_payment
+    else:
+        # Create new payment record
+        payment = Payment(
+            order_id=order.id,
+            amount=order.total_amount,
+            payment_method="CARD",  # Will be updated based on actual method used
+            status=PaymentStatus.PENDING,
+        )
+        db.add(payment)
+        db.flush()
+
+    # Generate unique transaction reference
+    import uuid
+    reference = f"twelve09_{order.id}_{uuid.uuid4().hex[:12]}"
+    payment.provider_reference = reference
+    payment.provider = "paystack"
+    payment.amount = order.total_amount
+    payment.currency = "NGN"
+
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+
+    # Initialize Paystack transaction
+    try:
+        callback_url = payload.callback_url
+        if not callback_url:
+            # Default callback to frontend confirmation page
+            callback_url = f"{settings.CORS_ALLOWED_ORIGINS.split(',')[0]}/orders/{order.id}/confirmation"
+
+        paystack_data = await paystack_client.initialize_transaction(
+            email=current_user.email,
+            amount=order.total_amount,
+            reference=reference,
+            callback_url=callback_url,
+            metadata={
+                "order_id": order.id,
+                "payment_id": payment.id,
+                "user_id": current_user.id,
+            },
+        )
+
+        # Store Paystack response metadata (payment_metadata is the mapped column)
+        payment.payment_metadata = {
+            "paystack_authorization_url": paystack_data.get("authorization_url"),
+            "paystack_access_code": paystack_data.get("access_code"),
+            "paystack_reference": paystack_data.get("reference"),
+        }
+        db.add(payment)
+        db.commit()
+        db.refresh(payment)
+
+        return {
+            "authorization_url": paystack_data.get("authorization_url"),
+            "access_code": paystack_data.get("access_code"),
+            "reference": paystack_data.get("reference"),
+        }
+
+    except PaystackError as e:
+        # Mark payment as failed
+        payment.status = "FAILED"
+        db.add(payment)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Payment initialization failed: {e.message}",
+        )
+
+
+@app.post("/webhooks/paystack")
+async def paystack_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Handle Paystack webhook events."""
+    # Get raw body for signature verification
+    body = await request.body()
+
+    # Get signature from header
+    signature = request.headers.get("x-paystack-signature")
+    if not signature:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Paystack signature",
+        )
+
+    # Verify signature
+    if not paystack_client.verify_signature(body, signature):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Paystack signature",
+        )
+
+    # Parse event
+    try:
+        event_data = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON payload",
+        )
+
+    event = event_data.get("event")
+    data = event_data.get("data", {})
+
+    # Handle charge.success event
+    if event == "charge.success":
+        reference = data.get("reference")
+        if not reference:
+            return {"status": "ignored", "reason": "no reference"}
+
+        # Find payment by provider_reference
+        payment = db.query(Payment).filter(Payment.provider_reference == reference).first()
+        if not payment:
+            # Log but don't fail - might be a test or unknown reference
+            return {"status": "ignored", "reason": "payment not found"}
+
+        # Idempotency guard: already-processed successful payments must not be
+        # reprocessed, re-timestamped, or have their order updated again.
+        if payment.status == PaymentStatus.SUCCESS:
+            return {"status": "verified", "result": "already_processed"}
+
+        # Verify transaction with Paystack
+        try:
+            verification = await paystack_client.verify_transaction(reference)
+        except PaystackVerificationError:
+            # Mark payment as failed
+            payment.status = "FAILED"
+            db.add(payment)
+            db.commit()
+            return {"status": "verified", "result": "failed"}
+
+        # Verify amount and currency
+        amount = Decimal(str(verification.get("amount", 0))) / 100  # Convert from kobo
+        currency = verification.get("currency", "NGN")
+        gateway_status = verification.get("status", "").lower()
+
+        if amount != payment.amount:
+            # Amount mismatch on a transaction Paystack reports as successful.
+            # Money may actually have been received, so the payment must NOT be
+            # marked FAILED (that would hide real funds). Keep it PENDING for
+            # manual investigation and preserve full evidence.
+            payment.status = PaymentStatus.PENDING
+            payment.payment_metadata = {
+                **(payment.payment_metadata or {}),
+                "amount_mismatch": {
+                    "expected": str(payment.amount),
+                    "received": str(amount),
+                    "paystack_reference": reference,
+                    "paystack_verification": verification,
+                    "requires_manual_review": True,
+                },
+            }
+            db.add(payment)
+            db.commit()
+            return {"status": "verified", "result": "amount_mismatch"}
+
+        if currency != "NGN":
+            # Currency mismatch: do not confirm, and do not mark FAILED —
+            # funds may exist in another currency. Keep PENDING with evidence
+            # for manual review.
+            payment.status = PaymentStatus.PENDING
+            payment.payment_metadata = {
+                **(payment.payment_metadata or {}),
+                "currency_mismatch": {
+                    "expected": "NGN",
+                    "received": currency,
+                    "paystack_reference": reference,
+                    "paystack_verification": verification,
+                    "requires_manual_review": True,
+                },
+            }
+            db.add(payment)
+            db.commit()
+            return {"status": "verified", "result": "currency_mismatch"}
+
+        if gateway_status == "success":
+            # Mark payment as successful
+            payment.status = "SUCCESS"
+            payment.paid_at = datetime.now(timezone.utc)
+            payment.payment_metadata = {
+                **(payment.payment_metadata or {}),
+                "paystack_verification": verification,
+            }
+            db.add(payment)
+
+            # Update order status to CONFIRMED
+            order = db.query(Order).filter(Order.id == payment.order_id).first()
+            if order:
+                order.status = "CONFIRMED"
+                db.add(order)
+
+            db.commit()
+            return {"status": "verified", "result": "success"}
+
+        else:
+            # Payment failed on Paystack side
+            payment.status = "FAILED"
+            payment.payment_metadata = {
+                **(payment.payment_metadata or {}),
+                "paystack_status": gateway_status,
+            }
+            db.add(payment)
+            db.commit()
+            return {"status": "verified", "result": "failed"}
+
+    # Handle failed charge
+    elif event == "charge.failed":
+        reference = data.get("reference")
+        if reference:
+            payment = db.query(Payment).filter(Payment.provider_reference == reference).first()
+            if payment:
+                payment.status = "FAILED"
+                payment.payment_metadata = {
+                    **(payment.payment_metadata or {}),
+                    "paystack_failure_reason": data.get("gateway_response"),
+                }
+                db.add(payment)
+                db.commit()
+
+        return {"status": "ignored"}
+
+    # Ignore other events
+    return {"status": "ignored"}
 
 
 @app.get("/addresses", response_model=list[AddressRead])
