@@ -1632,6 +1632,9 @@ async def paystack_webhook(
 
         # Idempotency guard: already-processed successful payments must not be
         # reprocessed, re-timestamped, or have their order updated again.
+        # This prevents duplicate webhook deliveries from altering a confirmed
+        # payment state. If a "charge.success" webhook is repeated, the handler
+        # returns "already_processed" without modifying the payment or order.
         if payment.status == PaymentStatus.SUCCESS:
             return {"status": "verified", "result": "already_processed"}
 
@@ -1732,10 +1735,14 @@ async def paystack_webhook(
                 }
                 db.add(payment)
                 db.commit()
-
+        # Duplicate failed event deliveries are idempotent — the payment
+        # status is already FAILED, so re-processing does not change the state.
         return {"status": "ignored"}
 
-    # Ignore other events
+    # Ignore other (unhandled) Paystack events
+    # These events are received but not processed — payment state is not changed.
+    # Returns "ignored" to acknowledge receipt without side effects.
+    # Duplicate deliveries are idempotent — the same "ignored" response is returned.
     return {"status": "ignored"}
 
 
