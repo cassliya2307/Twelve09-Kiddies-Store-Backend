@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     DB_MAX_OVERFLOW: int = 10
     DB_POOL_RECYCLE: int = 3600
     DB_POOL_TIMEOUT: int = 30
-    CORS_ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
+    CORS_ALLOWED_ORIGINS: str = "https://twelve09-kiddies-store-frontend-sepia.vercel.app,http://localhost:3000,http://localhost:5173"
     CORS_ALLOW_CREDENTIALS: bool = True
     ENVIRONMENT: str = "development"
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), extra="ignore")
