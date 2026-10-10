@@ -7,7 +7,7 @@ from typing import Optional
 class PaymentCreate(BaseModel):
     order_id: int = Field(..., gt=0, description="Order ID to associate payment with")
     payment_method: str = Field(
-        ..., min_length=1, max_length=100, description="Payment method (e.g., STRIPE, PAYSTACK, CASH)"
+        ..., min_length=1, max_length=100, description="Payment method (e.g., PAYSTACK, BANK_TRANSFER, CASH)"
     )
     transaction_reference: str | None = Field(
         default=None, max_length=255, description="External payment provider transaction reference"

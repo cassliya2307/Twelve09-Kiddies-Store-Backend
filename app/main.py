@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import sys
@@ -7,9 +7,9 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import text, String, cast, func
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from decimal import Decimal
 from pathlib import Path
@@ -23,7 +23,7 @@ from app.core.auth import (
     verify_password,
 )
 from app.services.paystack import paystack_client, PaystackError, PaystackVerificationError
-from app.core.database import get_db, settings
+from app.core.database import get_db, settings, utcnow
 from app.models import (
     Address,
     Category,
@@ -1311,6 +1311,18 @@ def create_payment(
     db: Session = Depends(get_db),
 ) -> PaymentRead:
     """Create a payment for an order."""
+    # Validate payment method is supported
+    # PAYSTACK and CARD both map to the Paystack integration internally
+    # STRIPE is an existing payment method used by tests/integration
+    # BANK_TRANSFER is a new recognized payment method
+    # CASH is permitted only for STORE_PICKUP (enforced below)
+    allowed_methods = {"PAYSTACK", "CARD", "STRIPE", "BANK_TRANSFER", "CASH"}
+    if payload.payment_method not in allowed_methods:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported payment method: {payload.payment_method}. Allowed methods: {sorted(allowed_methods)}",
+        )
+
     # Validate order exists
     order = db.query(Order).filter(Order.id == payload.order_id).first()
     if order is None:
@@ -1325,6 +1337,18 @@ def create_payment(
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Not authorized to pay for this order",
+            )
+
+    # Enforce fulfillment/payment compatibility using server-side order data.
+    # The database order is authoritative — do not trust client-supplied fulfillment.
+    fulfillment = order.fulfillment_method
+
+    # CASH is only permitted for STORE_PICKUP
+    if payload.payment_method == "CASH":
+        if fulfillment in {FulfillmentMethod.STORE_DELIVERY, FulfillmentMethod.CUSTOMER_DISPATCH}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"CASH payment is not allowed for {fulfillment.value}. CASH is only permitted for STORE_PICKUP.",
             )
 
     # Prevent duplicate payment
@@ -1524,10 +1548,18 @@ async def initialize_paystack_payment(
         db.add(payment)
         db.flush()
 
-    # Generate unique transaction reference
+    # Preserve existing provider_reference if present.
+    # Only generate a new reference if the payment doesn't have one yet.
+    # If a new reference must replace an existing one (e.g., Paystack rejects
+    # the duplicate), store the old reference in payment_metadata for recovery.
     import uuid
-    reference = f"twelve09_{order.id}_{uuid.uuid4().hex[:12]}"
-    payment.provider_reference = reference
+    if payment.provider_reference:
+        # Reuse the existing reference - Paystack may accept re-initialization
+        # with the same reference if the original transaction is still pending.
+        reference = payment.provider_reference
+    else:
+        reference = f"twelve09_{order.id}_{uuid.uuid4().hex[:12]}"
+        payment.provider_reference = reference
     payment.provider = "paystack"
     payment.amount = order.total_amount
     payment.currency = "NGN"
@@ -1572,7 +1604,74 @@ async def initialize_paystack_payment(
         }
 
     except PaystackError as e:
-        # Mark payment as failed
+        # Check if this is a duplicate reference error
+        if getattr(e, "is_duplicate_reference", False):
+            # Duplicate reference - rotate the reference and retry once
+            old_reference = payment.provider_reference
+            # Generate new reference
+            import uuid
+            new_reference = f"twelve09_{order.id}_{uuid.uuid4().hex[:12]}"
+            
+            # Update payment_metadata with previous_references
+            existing_metadata = payment.payment_metadata or {}
+            prev_refs = existing_metadata.get("previous_references", [])
+            if old_reference not in prev_refs:
+                prev_refs.append(old_reference)
+            
+            payment.payment_metadata = {
+                **existing_metadata,
+                "previous_references": prev_refs,
+            }
+            
+            # Update provider_reference to new reference
+            payment.provider_reference = new_reference
+            payment.status = PaymentStatus.PENDING
+            db.add(payment)
+            db.commit()
+            db.refresh(payment)
+            
+            # Retry initialization with new reference
+            try:
+                paystack_data = await paystack_client.initialize_transaction(
+                    email=current_user.email,
+                    amount=order.total_amount,
+                    reference=new_reference,
+                    callback_url=callback_url,
+                    metadata={
+                        "order_id": order.id,
+                        "payment_id": payment.id,
+                        "user_id": current_user.id,
+                    },
+                )
+                
+                # Store Paystack response metadata
+                payment.payment_metadata = {
+                    **(payment.payment_metadata or {}),
+                    "paystack_authorization_url": paystack_data.get("authorization_url"),
+                    "paystack_access_code": paystack_data.get("access_code"),
+                    "paystack_reference": paystack_data.get("reference"),
+                }
+                db.add(payment)
+                db.commit()
+                db.refresh(payment)
+                
+                return {
+                    "authorization_url": paystack_data.get("authorization_url"),
+                    "access_code": paystack_data.get("access_code"),
+                    "reference": paystack_data.get("reference"),
+                }
+                
+            except PaystackError as retry_error:
+                # Retry failed - mark payment as failed, preserve metadata
+                payment.status = "FAILED"
+                db.add(payment)
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Payment initialization failed after reference rotation: {retry_error.message}",
+                )
+        
+        # Not a duplicate reference error, or rotation failed - mark as failed
         payment.status = "FAILED"
         db.add(payment)
         db.commit()
@@ -1580,6 +1679,377 @@ async def initialize_paystack_payment(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Payment initialization failed: {e.message}",
         )
+
+
+class PaystackVerifyRequest(BaseModel):
+    reference: str = Field(
+        ..., min_length=1, max_length=255, description="Paystack transaction reference from customer return"
+    )
+
+
+class PaystackVerifyRequest(BaseModel):
+    reference: str = Field(
+        ..., min_length=1, max_length=255, description="Paystack transaction reference from customer return"
+    )
+
+
+@app.post("/payments/paystack/verify")
+async def verify_paystack_payment(
+    payload: PaystackVerifyRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Verify a Paystack transaction for the returning customer.
+
+    The presented reference is the only payment identity accepted from the
+    customer. Success, amount, currency and status are never trusted from
+    the frontend — the transaction is always re-verified with Paystack and
+    compared against the server-side Payment record.
+    """
+    presented_reference = (payload.reference or "").strip()
+    if not presented_reference:
+        return {"status": "ignored", "result": "unknown_reference"}
+
+    # 1. Resolve the Payment: primary lookup, then the same
+    # previous_references fallback used by the hardened webhook.
+    payment = db.query(Payment).filter(Payment.provider_reference == presented_reference).first()
+    if payment is None:
+        candidates = (
+            db.query(Payment)
+            .filter(
+                cast(
+                    func.json_extract(Payment.payment_metadata, "$.previous_references"),
+                    String,
+                ).like(f"%{presented_reference}%")
+            )
+            .all()
+        )
+        if len(candidates) == 1:
+            payment = candidates[0]
+        else:
+            # Zero matches (unknown reference) or multiple matches (ambiguous):
+            # fail closed with the same generic response so callers cannot
+            # distinguish unknown, ambiguous, or other-customer references.
+            if len(candidates) > 1:
+                logger.warning("Ambiguous previous reference presented to verify endpoint")
+            return {"status": "ignored", "result": "unknown_reference"}
+
+    # 2. Ownership: the Payment's Order must belong to the caller.
+    # Admin bypass mirrors payment initialization; anything else (including a
+    # reference belonging to another customer) gets the generic response with
+    # no payment/order data and no state change.
+    order = db.query(Order).filter(Order.id == payment.order_id).first()
+    if order is None or order.user_id != current_user.id:
+        if order is None or not require_admin(current_user):
+            return {"status": "ignored", "result": "unknown_reference"}
+
+    # Idempotency fast path (re-checked under row lock below).
+    if payment.status == PaymentStatus.SUCCESS:
+        return {"status": "verified", "result": "already_processed"}
+
+    # 3. Re-verify with Paystack using the PRESENTED reference (never the
+    # stored provider_reference when they differ after rotation).
+    try:
+        verification = await paystack_client.verify_transaction(presented_reference)
+    except PaystackVerificationError:
+        # Do not falsely confirm; leave state untouched so the existing
+        # polling/webhook flow can proceed.
+        return {"status": "verified", "result": "verification_failed"}
+
+    # The Paystack response must correspond to the presented reference, and
+    # the presented reference must be recorded on the resolved Payment.
+    paystack_reference = verification.get("reference")
+    if paystack_reference != presented_reference:
+        return {"status": "verified", "result": "reference_mismatch"}
+    recorded_references = {payment.provider_reference} | set(
+        (payment.payment_metadata or {}).get("previous_references", []) or []
+    )
+    if presented_reference not in recorded_references:
+        return {"status": "verified", "result": "reference_mismatch"}
+
+    # 4/5. Amount (NGN kobo conversion) and currency validation — same
+    # conventions as the webhook. The Paystack server response is authoritative.
+    amount = Decimal(str(verification.get("amount", 0))) / 100  # Convert from kobo
+    currency = verification.get("currency", "NGN")
+    gateway_status = verification.get("status", "").lower()
+
+    # Lock the Payment row and re-check status so concurrent webhook/verify
+    # deliveries cannot double-confirm.
+    locked_payment = db.query(Payment).filter(Payment.id == payment.id).with_for_update().first()
+    if locked_payment is None:
+        return {"status": "ignored", "result": "unknown_reference"}
+    if locked_payment.status == PaymentStatus.SUCCESS:
+        return {"status": "verified", "result": "already_processed"}
+
+    if amount != locked_payment.amount:
+        # Amount mismatch: keep PENDING for manual review with full evidence
+        # (funds may actually have been received — never mark FAILED here).
+        locked_payment.status = PaymentStatus.PENDING
+        locked_payment.payment_metadata = {
+            **(locked_payment.payment_metadata or {}),
+            "amount_mismatch": {
+                "expected": str(locked_payment.amount),
+                "received": str(amount),
+                "paystack_reference": presented_reference,
+                "paystack_verification": verification,
+                "requires_manual_review": True,
+            },
+        }
+        db.add(locked_payment)
+        db.commit()
+        return {"status": "verified", "result": "amount_mismatch"}
+
+    if currency != "NGN":
+        # Currency mismatch: keep PENDING for manual review, never confirm.
+        locked_payment.status = PaymentStatus.PENDING
+        locked_payment.payment_metadata = {
+            **(locked_payment.payment_metadata or {}),
+            "currency_mismatch": {
+                "expected": "NGN",
+                "received": currency,
+                "paystack_reference": presented_reference,
+                "paystack_verification": verification,
+                "requires_manual_review": True,
+            },
+        }
+        db.add(locked_payment)
+        db.commit()
+        return {"status": "verified", "result": "currency_mismatch"}
+
+    if gateway_status == "success":
+        locked_payment.status = PaymentStatus.SUCCESS
+        locked_payment.paid_at = datetime.now(timezone.utc)
+        locked_payment.payment_metadata = {
+            **(locked_payment.payment_metadata or {}),
+            "paystack_verification": verification,
+        }
+        db.add(locked_payment)
+
+        # Confirm the order only if still PENDING — never resurrect CANCELLED
+        # or regress PROCESSING/READY_FOR_PICKUP/OUT_FOR_DELIVERY/COMPLETED.
+        locked_order = (
+            db.query(Order)
+            .filter(Order.id == locked_payment.order_id)
+            .with_for_update()
+            .first()
+        )
+        if locked_order and locked_order.status == OrderStatus.PENDING:
+            locked_order.status = OrderStatus.CONFIRMED
+            db.add(locked_order)
+        elif locked_order and locked_order.status == OrderStatus.CANCELLED:
+            # Late success after cancellation/expiry: record success but never
+            # resurrect. Flag for manual review / refund (no automatic refund).
+            locked_payment.payment_metadata = {
+                **(locked_payment.payment_metadata or {}),
+                "late_success": {
+                    "requires_manual_review": True,
+                    "refund_required": True,
+                    "order_status": locked_order.status.value,
+                    "paystack_reference": presented_reference,
+                    "recorded_at": utcnow().isoformat(),
+                },
+            }
+            db.add(locked_payment)
+
+        db.commit()
+        return {"status": "verified", "result": "success"}
+
+    if gateway_status in {"failed", "abandoned"}:
+        # Terminal Paystack failure: mark FAILED, leave the order unchanged.
+        locked_payment.status = PaymentStatus.FAILED
+        locked_payment.payment_metadata = {
+            **(locked_payment.payment_metadata or {}),
+            "paystack_status": gateway_status,
+        }
+        db.add(locked_payment)
+        db.commit()
+        return {"status": "verified", "result": "failed"}
+
+    # Non-terminal/unknown gateway status: leave PENDING so the existing
+    # webhook polling flow (or a later webhook) can complete the payment.
+    return {"status": "verified", "result": "pending"}
+
+
+# Phase 3: a PENDING Paystack payment holds decremented stock from order
+# creation. If it stays unpaid beyond this window, a scheduled external
+# caller (Railway cron) invokes POST /admin/payments/reclaim-stale below.
+STALE_PAYSTACK_PAYMENT_EXPIRY_MINUTES = 30
+
+
+def _as_naive_utc(value: datetime | None) -> datetime | None:
+    """Normalize a timestamp for age comparison.
+
+    SQLite/MySQL return naive datetimes while utcnow() is tz-aware; compare
+    in naive UTC space so candidate selection behaves identically on both.
+    """
+    if value is None:
+        return None
+    return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+
+@app.post("/admin/payments/reclaim-stale")
+async def reclaim_stale_paystack_payments(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Reclaim stock from stale PENDING Paystack payments (admin only).
+
+    A payment is stale when it uses the Paystack provider, is still PENDING,
+    its order is still PENDING, and the payment row (whose updated_at is
+    refreshed by every initialize/retry/rotation write) is older than
+    STALE_PAYSTACK_PAYMENT_EXPIRY_MINUTES.
+
+    For each candidate the Payment and Order rows are locked and re-checked,
+    then Paystack is re-verified with the CURRENT provider_reference before
+    any stock is touched. Verification errors fail closed (no reclaim).
+    Safe to call repeatedly; stock is restored exactly once.
+    """
+    if not require_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator privileges required",
+        )
+
+    cutoff = utcnow() - timedelta(minutes=STALE_PAYSTACK_PAYMENT_EXPIRY_MINUTES)
+    cutoff_naive = _as_naive_utc(cutoff)
+
+    candidates = (
+        db.query(Payment)
+        .join(Order, Order.id == Payment.order_id)
+        .filter(
+            Payment.provider == "paystack",
+            Payment.status == PaymentStatus.PENDING,
+            Order.status == OrderStatus.PENDING,
+        )
+        .all()
+    )
+
+    counts = {
+        "scanned": 0,
+        "reclaimed": 0,
+        "succeeded_during_check": 0,
+        "still_pending": 0,
+        "skipped": 0,
+        "verification_errors": 0,
+    }
+
+    for candidate in candidates:
+        # Pre-lock age screen (re-evaluated after locks below).
+        if _as_naive_utc(candidate.updated_at) is None or _as_naive_utc(candidate.updated_at) >= cutoff_naive:
+            counts["skipped"] += 1
+            continue
+        counts["scanned"] += 1
+
+        # Lock the Payment row and re-check every eligibility condition.
+        locked_payment = db.query(Payment).filter(Payment.id == candidate.id).with_for_update().first()
+        if (
+            locked_payment is None
+            or locked_payment.provider != "paystack"
+            or locked_payment.status != PaymentStatus.PENDING
+            or _as_naive_utc(locked_payment.updated_at) is None
+            or _as_naive_utc(locked_payment.updated_at) >= cutoff_naive
+        ):
+            counts["skipped"] += 1
+            continue
+
+        # Lock the Order row and re-check.
+        locked_order = (
+            db.query(Order)
+            .filter(Order.id == locked_payment.order_id)
+            .with_for_update()
+            .first()
+        )
+        if locked_order is None or locked_order.status != OrderStatus.PENDING:
+            counts["skipped"] += 1
+            continue
+
+        reference = locked_payment.provider_reference
+        if not reference:
+            # Nothing verifiable at Paystack — leave untouched.
+            counts["skipped"] += 1
+            continue
+
+        # Re-verify with Paystack using the CURRENT reference before touching
+        # stock. A customer may have paid while the reaper was running.
+        try:
+            verification = await paystack_client.verify_transaction(reference)
+        except PaystackVerificationError:
+            # Fail closed: network/gateway errors must never cause reclamation.
+            counts["verification_errors"] += 1
+            continue
+
+        if verification.get("reference") != reference:
+            counts["still_pending"] += 1
+            continue
+
+        amount = Decimal(str(verification.get("amount", 0))) / 100
+        currency = verification.get("currency", "NGN")
+        gateway_status = verification.get("status", "").lower()
+
+        if gateway_status == "success" and amount == locked_payment.amount and currency == "NGN":
+            # Paid during the check: confirm, never reclaim.
+            locked_payment.status = PaymentStatus.SUCCESS
+            locked_payment.paid_at = datetime.now(timezone.utc)
+            locked_payment.payment_metadata = {
+                **(locked_payment.payment_metadata or {}),
+                "paystack_verification": verification,
+            }
+            db.add(locked_payment)
+            locked_order.status = OrderStatus.CONFIRMED
+            db.add(locked_order)
+            db.commit()
+            counts["succeeded_during_check"] += 1
+            continue
+
+        if gateway_status == "success":
+            # Success-shaped response that fails amount/currency validation:
+            # funds may exist — record evidence, keep holding, never reclaim.
+            key = "amount_mismatch" if amount != locked_payment.amount else "currency_mismatch"
+            locked_payment.payment_metadata = {
+                **(locked_payment.payment_metadata or {}),
+                key: {
+                    "expected": str(locked_payment.amount) if key == "amount_mismatch" else "NGN",
+                    "received": str(amount) if key == "amount_mismatch" else currency,
+                    "paystack_reference": reference,
+                    "paystack_verification": verification,
+                    "requires_manual_review": True,
+                },
+            }
+            db.add(locked_payment)
+            db.commit()
+            counts["still_pending"] += 1
+            continue
+
+        if gateway_status not in {"failed", "abandoned"}:
+            # Non-terminal (pending/unknown): leave PENDING for a later
+            # webhook or cleanup pass.
+            counts["still_pending"] += 1
+            continue
+
+        # Terminal Paystack failure on a stale unpaid payment: reclaim.
+        _restore_stock_for_cancelled_order(db, locked_order)
+        _validate_order_status_transition(
+            locked_order.status, OrderStatus.CANCELLED, locked_order.fulfillment_method
+        )
+        locked_order.status = OrderStatus.CANCELLED
+        db.add(locked_order)
+        locked_payment.payment_metadata = {
+            **(locked_payment.payment_metadata or {}),
+            "stale_reclaim": {
+                "reason": "stale_paystack_payment",
+                "expiry_minutes": STALE_PAYSTACK_PAYMENT_EXPIRY_MINUTES,
+                "reclaimed_at": utcnow().isoformat(),
+                "previous_payment_status": PaymentStatus.PENDING.value,
+                "paystack_status": gateway_status,
+                "paystack_reference": reference,
+                "order_id": locked_order.id,
+            },
+        }
+        db.add(locked_payment)
+        db.commit()
+        counts["reclaimed"] += 1
+
+    return counts
 
 
 @app.post("/webhooks/paystack")
@@ -1624,8 +2094,32 @@ async def paystack_webhook(
         if not reference:
             return {"status": "ignored", "reason": "no reference"}
 
-        # Find payment by provider_reference
+        # Find payment by provider_reference (primary lookup)
         payment = db.query(Payment).filter(Payment.provider_reference == reference).first()
+
+        # Fallback: if not found, check payment_metadata["previous_references"] array.
+        # For re-initialized payments where the reference was rotated, the old
+        # reference is stored in payment_metadata["previous_references"].
+        # Use JSON array containment check (works for SQLite JSON1 and MySQL JSON).
+        # Fail closed if multiple payments match the same reference.
+        if not payment:
+            candidates = (
+                db.query(Payment)
+                .filter(
+                    cast(
+                        func.json_extract(Payment.payment_metadata, '$.previous_references'),
+                        String
+                    ).like(f"%{reference}%")
+                )
+                .all()
+            )
+            if len(candidates) == 1:
+                payment = candidates[0]
+            elif len(candidates) > 1:
+                # Multiple payments share the same previous reference — fail closed.
+                return {"status": "ignored", "reason": "ambiguous previous reference"}
+            # else: zero candidates, payment remains None
+
         if not payment:
             # Log but don't fail - might be a test or unknown reference
             return {"status": "ignored", "reason": "payment not found"}
@@ -1702,11 +2196,31 @@ async def paystack_webhook(
             }
             db.add(payment)
 
-            # Update order status to CONFIRMED
-            order = db.query(Order).filter(Order.id == payment.order_id).first()
-            if order:
-                order.status = "CONFIRMED"
+            # Update order status to CONFIRMED only if currently PENDING.
+            # Lock the order row to prevent race with cancellation.
+            order = (
+                db.query(Order)
+                .filter(Order.id == payment.order_id)
+                .with_for_update()
+                .first()
+            )
+            if order and order.status == OrderStatus.PENDING:
+                order.status = OrderStatus.CONFIRMED
                 db.add(order)
+            elif order and order.status == OrderStatus.CANCELLED:
+                # Late success after cancellation/expiry: keep CANCELLED and
+                # flag for manual review / refund (no automatic refund).
+                payment.payment_metadata = {
+                    **(payment.payment_metadata or {}),
+                    "late_success": {
+                        "requires_manual_review": True,
+                        "refund_required": True,
+                        "order_status": order.status.value,
+                        "paystack_reference": reference,
+                        "recorded_at": utcnow().isoformat(),
+                    },
+                }
+                db.add(payment)
 
             db.commit()
             return {"status": "verified", "result": "success"}
@@ -1728,6 +2242,9 @@ async def paystack_webhook(
         if reference:
             payment = db.query(Payment).filter(Payment.provider_reference == reference).first()
             if payment:
+                # Guard: do not downgrade terminal successful/refunded payments
+                if payment.status in {PaymentStatus.SUCCESS, PaymentStatus.REFUNDED}:
+                    return {"status": "verified", "result": "already_processed"}
                 payment.status = "FAILED"
                 payment.payment_metadata = {
                     **(payment.payment_metadata or {}),

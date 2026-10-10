@@ -20,6 +20,19 @@ class PaystackError(Exception):
         self.details = details
         super().__init__(message)
 
+    @property
+    def is_duplicate_reference(self) -> bool:
+        """Check if this error is due to a duplicate transaction reference."""
+        if not self.details:
+            return False
+        # Paystack returns a 400 with message containing "already been used" or similar
+        # for duplicate references. Check common patterns.
+        msg = str(self.details.get("message", "")).lower()
+        return any(
+            keyword in msg
+            for keyword in ["already been used", "reference has already been used", "duplicate reference"]
+        )
+
 
 class PaystackSignatureError(PaystackError):
     """Raised when webhook signature verification fails."""
