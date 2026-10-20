@@ -15,17 +15,22 @@ def utcnow() -> datetime:
 
 
 def normalize_database_url(url: str) -> str:
-    """Normalize DATABASE_URL to use PyMySQL driver for MySQL connections.
+    """Normalize DATABASE_URL to use the appropriate driver for each dialect.
 
     Converts generic mysql:// URLs to mysql+pymysql:// to ensure SQLAlchemy
     selects the PyMySQL driver instead of MySQLdb (mysqlclient).
+    Converts postgres://, postgresql://, and postgresql+psycog:// URLs to
+    postgresql+psycopg2:// to ensure SQLAlchemy selects the psycopg2 driver.
     """
     if not url:
         return url
 
     parsed = urlparse(url)
-    if parsed.scheme == "mysql":
+    scheme = parsed.scheme
+    if scheme == "mysql":
         return urlunparse(parsed._replace(scheme="mysql+pymysql"))
+    if scheme in ("postgres", "postgresql", "postgresql+psycopg"):
+        return urlunparse(parsed._replace(scheme="postgresql+psycopg2"))
     return url
 
 
