@@ -38,6 +38,22 @@ class UserRead(UserBase):
         from_attributes = True
 
 
+class CustomerSummary(BaseModel):
+    id: int
+    name: str
+    email: EmailStr
+    role: UserRole = UserRole.CUSTOMER
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class CustomerListResponse(BaseModel):
+    items: list[CustomerSummary]
+    has_more: bool
+
+
 class UserUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=150)
     email: EmailStr | None = None

@@ -74,5 +74,20 @@ class OrderRead(BaseModel):
         from_attributes = True
 
 
+class CustomerOrderSummary(BaseModel):
+    id: int
+    total_amount: float
+    status: OrderStatus
+    created_at: datetime | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class CustomerOrderHistoryResponse(BaseModel):
+    items: list[CustomerOrderSummary]
+    has_more: bool
+
+
 class OrderStatusUpdate(BaseModel):
     status: OrderStatus

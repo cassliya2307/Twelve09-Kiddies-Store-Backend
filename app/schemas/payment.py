@@ -32,9 +32,43 @@ class PaymentRead(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
+    # Receipt fields
+    receipt_filename: Optional[str] = None
+    receipt_mime_type: Optional[str] = None
+    receipt_size: Optional[int] = None
+    receipt_uploaded_at: Optional[datetime] = None
+    receipt_reviewed_at: Optional[datetime] = None
+    receipt_reviewed_by: Optional[int] = None
+    receipt_rejection_reason: Optional[str] = None
+
     class Config:
         from_attributes = True
 
 
 class PaymentStatusUpdate(BaseModel):
     status: str = Field(..., description="Payment status: PENDING, SUCCESS, FAILED, REFUNDED")
+
+
+# Receipt upload/management schemas
+class ReceiptUploadResponse(BaseModel):
+    receipt_filename: str
+    receipt_mime_type: str
+    receipt_size: int
+    receipt_uploaded_at: datetime
+
+
+class ReceiptReviewRequest(BaseModel):
+    rejection_reason: str | None = Field(
+        default=None, description="Required when rejecting (max 1000 characters)"
+    )
+
+
+class ReceiptReviewResponse(BaseModel):
+    payment_id: int
+    status: str  # "APPROVED" | "REJECTED"
+    reviewed_at: datetime
+    reviewed_by: int
+    rejection_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True

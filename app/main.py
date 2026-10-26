@@ -18,6 +18,7 @@ from app.core.auth import (
     create_access_token,
     get_current_user,
     hash_password,
+    permission_required,
     require_admin,
     require_permission,
     verify_password,
@@ -42,7 +43,7 @@ from app.models import (
 )
 from app.schemas.address import AddressCreate, AddressRead, AddressUpdate
 from app.schemas.delivery_fee import DeliveryFeeRead, DeliveryFeeUpdate
-from app.schemas.payment import PaymentCreate, PaymentRead, PaymentStatusUpdate
+from app.schemas.payment import PaymentCreate, PaymentRead, PaymentStatusUpdate, ReceiptUploadResponse, ReceiptReviewRequest, ReceiptReviewResponse
 from app.schemas.expense import ExpenseCreate, ExpenseRead
 from app.schemas.checkout import (
     CartItemDetails,
@@ -50,7 +51,13 @@ from app.schemas.checkout import (
     CheckoutSummary,
     CheckoutValidationResponse,
 )
-from app.schemas.order import OrderCreate, OrderRead, OrderStatusUpdate
+from app.schemas.order import (
+    CustomerOrderHistoryResponse,
+    CustomerOrderSummary,
+    OrderCreate,
+    OrderRead,
+    OrderStatusUpdate,
+)
 from app.schemas.product import (
     CategoryCreate,
     CategoryRead,
@@ -64,7 +71,7 @@ from app.schemas.product_image import (
     ProductImageDeleteResponse,
     ProductImageUploadResponse,
 )
-from app.schemas.user import UserCreate, UserRead, UserUpdate
+from app.schemas.user import CustomerListResponse, CustomerSummary, UserCreate, UserRead, UserUpdate
 
 
 from app.services.product_image import (
@@ -74,6 +81,7 @@ from app.services.product_image import (
     upload_to_cloudinary,
     _validate_and_prepare_upload,
 )
+from app.services.receipt import validate_receipt_file
 from app.api.admin_dashboard import router as admin_dashboard_router
 
 
@@ -121,6 +129,21 @@ app.add_middleware(
 )
 
 app.include_router(admin_dashboard_router)
+
+
+def _previous_references_filter(db: Session, reference_str: str):
+    """Build a dialect-compatible filter for payment_metadata.previous_references.
+
+    MySQL uses JSON path extraction; PostgreSQL uses the ->> JSONB operator.
+    Both produce the same LIKE-based matching behavior.
+    """
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        return Payment.payment_metadata.op("->>")("previous_references").like(f"%{reference_str}%")
+    return cast(
+        func.json_extract(Payment.payment_metadata, "$.previous_references"),
+        String,
+    ).like(f"%{reference_str}%")
 
 
 def _get_user_address_for_update(db: Session, current_user: User, address_id: int) -> Address | None:
@@ -311,6 +334,91 @@ def list_users(
                 )
             )
     return query.order_by(User.created_at.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/admin/customers", response_model=CustomerListResponse)
+def list_customers(
+    is_active: bool | None = None,
+    search: str | None = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(permission_required(Permission.MANAGE_CUSTOMERS)),
+    db: Session = Depends(get_db),
+) -> CustomerListResponse:
+    query = db.query(User).filter(User.role == UserRole.CUSTOMER)
+    if is_active is not None:
+        query = query.filter(User.is_active == is_active)
+    if search is not None:
+        trimmed = search.strip()
+        if trimmed:
+            if len(trimmed) > 100:
+                trimmed = trimmed[:100]
+            escaped = trimmed.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            from sqlalchemy import or_
+
+            query = query.filter(
+                or_(
+                    User.name.ilike(pattern, escape="\\"),
+                    User.email.ilike(pattern, escape="\\"),
+                )
+            )
+
+    rows = query.order_by(User.created_at.desc(), User.id.desc()).offset(skip).limit(limit + 1).all()
+    return CustomerListResponse(
+        items=[
+            CustomerSummary(
+                id=customer.id,
+                name=customer.name,
+                email=customer.email,
+                role=UserRole.CUSTOMER,
+                is_active=customer.is_active,
+            )
+            for customer in rows[:limit]
+        ],
+        has_more=len(rows) > limit,
+    )
+
+
+@app.get(
+    "/admin/customers/{customer_id}/orders",
+    response_model=CustomerOrderHistoryResponse,
+)
+def list_customer_orders(
+    customer_id: int,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(permission_required(Permission.MANAGE_CUSTOMERS)),
+    db: Session = Depends(get_db),
+) -> CustomerOrderHistoryResponse:
+    customer_exists = (
+        db.query(User.id)
+        .filter(User.id == customer_id, User.role == UserRole.CUSTOMER)
+        .first()
+    )
+    if customer_exists is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+
+    rows = (
+        db.query(Order.id, Order.total_amount, Order.status, Order.created_at)
+        .filter(Order.user_id == customer_id)
+        .order_by(Order.created_at.desc(), Order.id.desc())
+        .offset(skip)
+        .limit(limit + 1)
+        .all()
+    )
+    return CustomerOrderHistoryResponse(
+        items=[
+            CustomerOrderSummary(
+                id=order_id,
+                total_amount=float(total_amount),
+                status=status_value,
+                created_at=created_at,
+            )
+            for order_id, total_amount, status_value, created_at in rows[:limit]
+        ],
+        has_more=len(rows) > limit,
+    )
 
 
 @app.patch("/admin/users/{user_id}/permissions", response_model=UserRead)
@@ -1483,6 +1591,349 @@ def update_payment_status(
     return payment
 
 
+# ---- Bank Transfer Receipt Routes ----
+
+# Maximum file size for receipt uploads (5 MiB)
+MAX_RECEIPT_SIZE = 5 * 1024 * 1024
+# Allowed MIME types and extensions for receipts
+ALLOWED_RECEIPT_MIME_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp"}
+ALLOWED_RECEIPT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _get_extension(filename: str) -> str:
+    """Get the lowercase file extension from a filename."""
+    from pathlib import Path
+    return Path(filename).suffix.lower()
+
+
+def _is_allowed_extension(ext: str) -> bool:
+    """Check if the extension is in the allowed list."""
+    return ext in ALLOWED_RECEIPT_EXTENSIONS
+
+
+def _is_allowed_mime_type(mime_type: str) -> bool:
+    """Check if the MIME type is in the allowed list."""
+    return mime_type in ALLOWED_RECEIPT_MIME_TYPES
+
+
+# MIME type signatures for file signature validation
+MIME_SIGNATURES: dict[str, list[bytes]] = {
+    "application/pdf": [b"%PDF"],
+    "image/jpeg": [b"\xff\xd8\xff"],
+    "image/png": [b"\x89PNG\r\n\x1a\n"],
+    "image/webp": [b"RIFF", b"WEBP"],
+}
+
+
+def _validate_file_signature(file_content: bytes, mime_type: str) -> bool:
+    """
+    Validate file signature (magic bytes) matches the expected MIME type.
+    """
+    signatures = MIME_SIGNATURES.get(mime_type, [])
+    return any(file_content.startswith(sig) for sig in signatures)
+
+
+@app.post("/payments/{payment_id}/receipt", response_model=ReceiptUploadResponse)
+async def upload_payment_receipt(
+    payment_id: int,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload a receipt for a bank-transfer payment.
+
+    Only the payment owner can upload a receipt.
+    Only BANK_TRANSFER payments in PENDING state without an existing receipt are accepted.
+    """
+    # Get payment with row lock to prevent concurrent uploads
+    payment = db.query(Payment).filter(Payment.id == payment_id).with_for_update().first()
+    if payment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment not found",
+        )
+
+    # Check ownership
+    if payment.order.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to upload receipt for this payment",
+        )
+
+    # Only BANK_TRANSFER payments can have receipts uploaded
+    if payment.payment_method != "BANK_TRANSFER":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Receipts can only be uploaded for BANK_TRANSFER payments",
+        )
+
+    # Payment must be in a reviewable state (PENDING)
+    if payment.status != PaymentStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot upload receipt for payment with status {payment.status.value}",
+        )
+
+    # Prevent duplicate uploads
+    if payment.receipt_data is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Receipt already uploaded for this payment",
+        )
+
+    # Read file content
+    file_content = await file.read()
+    if not file_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Empty file uploaded",
+        )
+
+    # Enforce file size limit
+    if len(file_content) > MAX_RECEIPT_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large. Maximum size: 5 MiB",
+        )
+
+    # Validate file
+    client_mime_type = file.content_type
+    is_valid, error_msg, detected_mime_type = validate_receipt_file(
+        file_content, file.filename or "", client_mime_type
+    )
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_msg,
+        )
+
+    # Use detected MIME type if client didn't provide one
+    if not client_mime_type:
+        client_mime_type = detected_mime_type
+
+    # Store receipt data
+    payment.receipt_data = file_content
+    payment.receipt_filename = file.filename or "receipt"
+    payment.receipt_mime_type = client_mime_type
+    payment.receipt_size = len(file_content)
+    payment.receipt_uploaded_at = utcnow()
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+
+    return ReceiptUploadResponse(
+        receipt_filename=payment.receipt_filename or "",
+        receipt_mime_type=payment.receipt_mime_type or "",
+        receipt_size=payment.receipt_size or 0,
+        receipt_uploaded_at=payment.receipt_uploaded_at or utcnow(),
+    )
+
+
+@app.get("/payments/{payment_id}/receipt")
+async def get_payment_receipt(
+    payment_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Retrieve a payment receipt.
+
+    Payment owner and ADMIN users can access the receipt.
+    """
+    payment = db.query(Payment).filter(Payment.id == payment_id).first()
+    if payment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment not found",
+        )
+
+    # Check ownership
+    if payment.order.user_id != current_user.id:
+        if not require_admin(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to access this receipt",
+            )
+
+    if payment.receipt_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No receipt uploaded for this payment",
+        )
+
+    # Stream the receipt content
+    from fastapi.responses import StreamingResponse
+    from io import BytesIO
+
+    media_type = payment.receipt_mime_type or "application/octet-stream"
+    filename = payment.receipt_filename or "receipt"
+
+    return StreamingResponse(
+        BytesIO(payment.receipt_data),
+        media_type=payment.receipt_mime_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payment.receipt_data)),
+        },
+    )
+
+
+@app.post("/payments/{payment_id}/receipt/approve", response_model=ReceiptReviewResponse)
+def approve_payment_receipt(
+    payment_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Approve a bank-transfer payment receipt (ADMIN only)."""
+    if not require_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator privileges required",
+        )
+
+    # Lock payment and order rows to prevent concurrent modifications
+    payment = db.query(Payment).filter(Payment.id == payment_id).with_for_update().first()
+    if payment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment not found",
+        )
+
+    # Only BANK_TRANSFER payments with receipts can be approved
+    if payment.payment_method != "BANK_TRANSFER":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only BANK_TRANSFER payments can be approved via receipt review",
+        )
+
+    if payment.receipt_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No receipt uploaded for this payment",
+        )
+
+    # Payment must be in a reviewable state
+    if payment.status != PaymentStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot approve payment with status {payment.status.value}",
+        )
+
+    # Update payment status to SUCCESS
+    payment.status = PaymentStatus.SUCCESS
+    payment.paid_at = utcnow()
+    payment.receipt_reviewed_at = utcnow()
+    payment.receipt_reviewed_by = current_user.id
+    payment.payment_metadata = {
+        **(payment.payment_metadata or {}),
+        "receipt_approval": {
+            "reviewed_by": current_user.id,
+            "reviewed_at": utcnow().isoformat(),
+            "action": "APPROVED",
+        },
+    }
+
+    # Lock and update order status if still PENDING
+    order = db.query(Order).filter(Order.id == payment.order_id).with_for_update().first()
+    if order and order.status == OrderStatus.PENDING:
+        order.status = OrderStatus.CONFIRMED
+        db.add(order)
+
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+
+    return ReceiptReviewResponse(
+        payment_id=payment.id,
+        status="APPROVED",
+        reviewed_at=payment.receipt_reviewed_at or utcnow(),
+        reviewed_by=payment.receipt_reviewed_by or 0,
+        rejection_reason=None,
+    )
+
+
+@app.post("/payments/{payment_id}/receipt/reject", response_model=ReceiptReviewResponse)
+def reject_payment_receipt(
+    payment_id: int,
+    payload: ReceiptReviewRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Reject a bank-transfer payment receipt (ADMIN only)."""
+    if not require_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator privileges required",
+        )
+
+    if not payload.rejection_reason or not payload.rejection_reason.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Rejection reason is required",
+        )
+
+    if len(payload.rejection_reason) > 1000:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Rejection reason must not exceed 1000 characters",
+        )
+
+    # Lock payment and order rows
+    payment = db.query(Payment).filter(Payment.id == payment_id).with_for_update().first()
+    if payment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment not found",
+        )
+
+    if payment.payment_method != "BANK_TRANSFER":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only BANK_TRANSFER payments can be rejected via receipt review",
+        )
+
+    if payment.receipt_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No receipt uploaded for this payment",
+        )
+
+    if payment.status != PaymentStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot reject payment with status {payment.status.value}",
+        )
+
+    # Update payment status to FAILED
+    payment.status = PaymentStatus.FAILED
+    payment.receipt_reviewed_at = utcnow()
+    payment.receipt_reviewed_by = current_user.id
+    payment.receipt_rejection_reason = payload.rejection_reason.strip()
+    payment.payment_metadata = {
+        **(payment.payment_metadata or {}),
+        "receipt_rejection": {
+            "reviewed_by": current_user.id,
+            "reviewed_at": utcnow().isoformat(),
+            "action": "REJECTED",
+            "reason": payload.rejection_reason.strip(),
+        },
+    }
+
+    # Keep order in PENDING state (stock already held from order creation)
+    # The order remains PENDING so customer can retry payment or admin can take action
+
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+
+    return ReceiptReviewResponse(
+        payment_id=payment.id,
+        status="REJECTED",
+        reviewed_at=payment.receipt_reviewed_at or utcnow(),
+        reviewed_by=payment.receipt_reviewed_by or 0,
+        rejection_reason=payment.receipt_rejection_reason,
+    )
+
+
 # ---- Paystack Payment Routes ----
 
 class PaystackInitializeRequest(BaseModel):
@@ -1716,12 +2167,7 @@ async def verify_paystack_payment(
     if payment is None:
         candidates = (
             db.query(Payment)
-            .filter(
-                cast(
-                    func.json_extract(Payment.payment_metadata, "$.previous_references"),
-                    String,
-                ).like(f"%{presented_reference}%")
-            )
+            .filter(_previous_references_filter(db, presented_reference))
             .all()
         )
         if len(candidates) == 1:
@@ -2105,12 +2551,7 @@ async def paystack_webhook(
         if not payment:
             candidates = (
                 db.query(Payment)
-                .filter(
-                    cast(
-                        func.json_extract(Payment.payment_metadata, '$.previous_references'),
-                        String
-                    ).like(f"%{reference}%")
-                )
+                .filter(_previous_references_filter(db, reference))
                 .all()
             )
             if len(candidates) == 1:

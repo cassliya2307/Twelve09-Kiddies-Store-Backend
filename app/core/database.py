@@ -5,6 +5,7 @@ from urllib.parse import urlparse, urlunparse
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -71,16 +72,15 @@ settings = Settings()
 def _engine_kwargs(database_url: str) -> dict:
     """Build engine keyword arguments conditional on the database dialect.
 
-    MySQL-specific pool parameters (pool_size, max_overflow, pool_recycle,
-    pool_timeout) are omitted for SQLite to avoid compatibility issues and
-    test-harness timeouts.
+    MySQL and PostgreSQL use pool_size, max_overflow, pool_recycle, and
+    pool_timeout. SQLite uses StaticPool with check_same_thread=False.
     """
     parsed = urlparse(database_url)
     scheme = (parsed.scheme or "").lower()
     kwargs = {
         "pool_pre_ping": True,
     }
-    if scheme == "sqlite":
+    if scheme in ("sqlite", "sqlite_async"):
         kwargs["poolclass"] = StaticPool
         kwargs["connect_args"] = _sqlite_connect_args(database_url)
     else:

@@ -5,7 +5,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DECIMAL, DateTime, Enum as SQLAlchemyEnum, ForeignKey, String, JSON
+from sqlalchemy import DECIMAL, DateTime, Enum as SQLAlchemyEnum, ForeignKey, String, JSON, Integer, Text, LargeBinary
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, utcnow
@@ -34,6 +34,17 @@ class Payment(Base):
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow, onupdate=utcnow)
+
+    # Receipt fields for bank-transfer workflow
+    # Use LargeBinary which maps to BYTEA on PostgreSQL and BLOB on SQLite
+    receipt_data: Mapped[bytes | None] = mapped_column(LargeBinary(), nullable=True)
+    receipt_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    receipt_mime_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    receipt_size: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    receipt_uploaded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    receipt_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    receipt_reviewed_by: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    receipt_rejection_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
     order: Mapped["Order"] = relationship(back_populates="payments")
 

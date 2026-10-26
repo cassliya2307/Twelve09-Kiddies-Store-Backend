@@ -19,3 +19,6 @@ env/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# SQL database dumps/exports contain sensitive data; never commit them
+*.sql

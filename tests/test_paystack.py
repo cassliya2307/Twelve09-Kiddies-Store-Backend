@@ -1643,36 +1643,41 @@ def test_payment_model_columns_match_migration_chain():
     'payments' column added by migrations must exist on the model. This catches
     the model/migration drift found in the Step 5E audit."""
 
-    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    # Check both MySQL and PostgreSQL Alembic migration directories
+    versions_dirs = [
+        Path(__file__).resolve().parents[1] / "alembic" / "versions",
+        Path(__file__).resolve().parents[1] / "alembic_pg" / "versions",
+    ]
     migration_columns: set[str] = set()
 
-    for path in sorted(versions_dir.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not isinstance(func, ast.Attribute) or func.attr not in ("create_table", "add_column"):
-                continue
-            args = node.args
-            table_arg = args[0] if args else None
-            if not isinstance(table_arg, ast.Constant) or table_arg.value != "payments":
-                continue
+    for versions_dir in versions_dirs:
+        for path in sorted(versions_dir.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not isinstance(func, ast.Attribute) or func.attr not in ("create_table", "add_column"):
+                    continue
+                args = node.args
+                table_arg = args[0] if args else None
+                if not isinstance(table_arg, ast.Constant) or table_arg.value != "payments":
+                    continue
 
-            if func.attr == "create_table":
-                for arg in args[1:]:
-                    if (
-                        isinstance(arg, ast.Call)
-                        and isinstance(arg.func, ast.Attribute)
-                        and arg.func.attr == "Column"
-                        and arg.args
-                        and isinstance(arg.args[0], ast.Constant)
-                    ):
-                        migration_columns.add(arg.args[0].value)
-            elif func.attr == "add_column" and len(args) >= 2 and isinstance(args[1], ast.Call):
-                inner = args[1]
-                if inner.args and isinstance(inner.args[0], ast.Constant):
-                    migration_columns.add(inner.args[0].value)
+                if func.attr == "create_table":
+                    for arg in args[1:]:
+                        if (
+                            isinstance(arg, ast.Call)
+                            and isinstance(arg.func, ast.Attribute)
+                            and arg.func.attr == "Column"
+                            and arg.args
+                            and isinstance(arg.args[0], ast.Constant)
+                        ):
+                            migration_columns.add(arg.args[0].value)
+                elif func.attr == "add_column" and len(args) >= 2 and isinstance(args[1], ast.Call):
+                    inner = args[1]
+                    if inner.args and isinstance(inner.args[0], ast.Constant):
+                        migration_columns.add(inner.args[0].value)
 
     model_columns = {column.name for column in Payment.__table__.columns}
 

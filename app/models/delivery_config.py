@@ -19,6 +19,4 @@ class DeliveryConfig(Base):
         DateTime, nullable=False, default=utcnow, onupdate=utcnow
     )
 
-    __table_args__ = (
-        {"sqlite_autoincrement": True},
-    )
+    pass

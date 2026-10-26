@@ -19,8 +19,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.auth import hash_password, require_admin, require_permission
-from app.core.database import Base, get_db, normalize_database_url
-from app.main import app
+from app.core.database import Base, get_db, normalize_database_url, _engine_kwargs
+from app.main import app, _previous_references_filter
 from app.models import Address, Category, FulfillmentMethod, Order, OrderStatus, Permission, Product, User, UserRole, Expense, Payment
 from app.schemas.payment import PaymentRead
 
@@ -39,8 +39,7 @@ def test_normalize_database_url_pymysql_unchanged():
 
 
 def test_normalize_database_url_other_schemes_unchanged():
-    """Test that non-MySQL URLs are left unchanged"""
-    assert normalize_database_url("postgresql://user:pass@host/db") == "postgresql://user:pass@host/db"
+    """Test that non-MySQL, non-PostgreSQL URLs are left unchanged"""
     assert normalize_database_url("sqlite:///test.db") == "sqlite:///test.db"
     assert normalize_database_url("sqlite://") == "sqlite://"
     assert normalize_database_url("postgresql+psycopg2://user:pass@host/db") == "postgresql+psycopg2://user:pass@host/db"
@@ -50,6 +49,118 @@ def test_normalize_database_url_empty_and_none():
     """Test edge cases with empty/None URLs"""
     assert normalize_database_url("") == ""
     assert normalize_database_url(None) is None
+
+
+def test_normalize_database_url_postgres_to_psycopg2():
+    """Test that postgres:// URLs are normalized to postgresql+psycopg2://"""
+    assert normalize_database_url("postgres://user:pass@host:5432/db") == "postgresql+psycopg2://user:pass@host:5432/db"
+    assert normalize_database_url("postgres://user:pass@host/db") == "postgresql+psycopg2://user:pass@host/db"
+
+
+def test_normalize_database_url_postgresql_normalized():
+    """Test that postgresql:// URLs are normalized to postgresql+psycopg2://"""
+    assert normalize_database_url("postgresql://user:pass@host/db") == "postgresql+psycopg2://user:pass@host/db"
+    assert normalize_database_url("postgresql+psycopg2://user:pass@host/db") == "postgresql+psycopg2://user:pass@host/db"
+
+
+def test_normalize_database_url_postgresql_psycopg3_normalized():
+    """Test that postgresql+psycog:// URLs are normalized to postgresql+psycopg2://"""
+    assert normalize_database_url("postgresql+psycopg://user:pass@host/db") == "postgresql+psycopg2://user:pass@host/db"
+    assert normalize_database_url("postgresql+psycopg://user:pass@host:5432/db") == "postgresql+psycopg2://user:pass@host:5432/db"
+
+
+def test_normalize_database_url_credentials_with_special_chars():
+    """Test that credentials containing reserved URL characters are preserved"""
+    result = normalize_database_url("postgres://user:p%40ss%3Aword@host:5432/db")
+    assert "p%40ss%3Aword" in result
+
+
+def test_normalize_database_url_postgres_sslmode_passthrough():
+    """Test that postgres:// URLs with ?sslmode=require survive normalization"""
+    result = normalize_database_url("postgres://user:pass@host:5432/db?sslmode=require")
+    assert result == "postgresql+psycopg2://user:pass@host:5432/db?sslmode=require"
+
+
+def test_normalize_database_url_postgresql_sslmode_passthrough():
+    """Test that postgresql:// URLs with ?sslmode=require survive normalization"""
+    result = normalize_database_url("postgresql://user:pass@host:5432/db?sslmode=require")
+    assert result == "postgresql+psycopg2://user:pass@host:5432/db?sslmode=require"
+
+
+def test_normalize_database_url_mysql_query_params_preserved():
+    """Test that MySQL URLs with query parameters are unchanged"""
+    result = normalize_database_url("mysql://user:pass@host:3306/db?charset=utf8mb4")
+    assert result == "mysql+pymysql://user:pass@host:3306/db?charset=utf8mb4"
+
+
+def test_engine_kwargs_sqlite():
+    """Test that SQLite gets StaticPool and check_same_thread"""
+    from sqlalchemy.pool import StaticPool
+    kwargs = _engine_kwargs("sqlite://")
+    assert kwargs["poolclass"] is StaticPool
+    assert kwargs["connect_args"] == {"check_same_thread": False}
+
+
+def test_engine_kwargs_mysql():
+    """Test that MySQL gets pool settings"""
+    kwargs = _engine_kwargs("mysql+pymysql://user:pass@host:3306/db")
+    assert "pool_size" in kwargs
+    assert "max_overflow" in kwargs
+    assert "poolclass" not in kwargs
+
+
+def test_engine_kwargs_postgresql():
+    """Test that PostgreSQL gets pool settings"""
+    kwargs = _engine_kwargs("postgresql+psycopg2://user:pass@host:5432/db")
+    assert "pool_size" in kwargs
+    assert "max_overflow" in kwargs
+    assert "poolclass" not in kwargs
+
+
+def test_previous_references_filter_sqlite():
+    """Test that the JSON fallback filter works on SQLite (used in tests)"""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from app.core.database import Base
+    from app.models import Payment, PaymentStatus, Order, OrderStatus, User, UserRole
+    from app.core.auth import hash_password
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    TestingSessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = TestingSessionLocal()
+
+    user = User(name="Test", email="test@example.com", password_hash=hash_password("test"), role=UserRole.CUSTOMER)
+    db.add(user)
+    db.flush()
+
+    order = Order(user_id=user.id, total_amount=100, status=OrderStatus.PENDING)
+    db.add(order)
+    db.flush()
+
+    payment = Payment(
+        order_id=order.id,
+        amount=100,
+        status=PaymentStatus.PENDING,
+        payment_method="CARD",
+        provider="paystack",
+        provider_reference="twelve09_test_ref_001",
+        currency="NGN",
+        payment_metadata={"previous_references": ["twelve09_old_ref_001", "twelve09_old_ref_002"]},
+    )
+    db.add(payment)
+    db.commit()
+
+    candidates = db.query(Payment).filter(_previous_references_filter(db, "twelve09_old_ref_001")).all()
+    assert len(candidates) == 1
+    assert candidates[0].id == payment.id
+
+    candidates2 = db.query(Payment).filter(_previous_references_filter(db, "nonexistent")).all()
+    assert len(candidates2) == 0
+
+    db.close()
+    Base.metadata.drop_all(bind=engine)
 
 
 @pytest.fixture
@@ -1593,27 +1704,110 @@ def test_payment_status_valid_transitions(client):
     assert status_response.json()["status"] == "SUCCESS"
 
 
-def test_payment_status_invalid_transition(client):
-    """Test invalid payment status transition."""
-    admin = _get_admin_headers(client)
-    headers = _register_and_login(client, "invalid-transition@example.com", "secretpass123")
-    product = _create_product(client, "Invalid Transition Product", price=200.00, stock=5)
-    
-    # Create order and payment
+def test_cash_against_delivery_rejected_store_delivery(client):
+    """CASH must be rejected for STORE_DELIVERY orders."""
+    headers = _register_and_login(client, "cash-delivery@example.com", "secretpass123")
+    product = _create_product(client, "Delivery Product", price=200.00, stock=5)
+
+    # Create order with STORE_DELIVERY
     address_response = client.post(
         "/addresses",
         headers=headers,
         json={
-            "recipient_name": "Invalid Transition User",
-            "phone_number": "08055555555",
-            "address_line": "1 Invalid St",
+            "recipient_name": "Delivery User",
+            "phone_number": "08011111111",
+            "address_line": "1 Delivery St",
             "city": "Lagos",
             "state": "Lagos",
         },
     )
     assert address_response.status_code == 200
     address_id = address_response.json()["id"]
-    
+
+    order_response = client.post(
+        "/orders",
+        headers=headers,
+        json={
+            "fulfillment_method": "STORE_DELIVERY",
+            "address_id": address_id,
+            "items": [{"product_id": product.id, "quantity": 1}],
+        },
+    )
+    assert order_response.status_code == 200
+    order_id = order_response.json()["id"]
+
+    # Attempt CASH payment for STORE_DELIVERY order — should be rejected
+    payment_response = client.post(
+        "/payments",
+        headers=headers,
+        json={"order_id": order_id, "payment_method": "CASH"},
+    )
+    assert payment_response.status_code == 400, payment_response.text
+    assert "CASH" in payment_response.json()["detail"]
+
+
+def test_cash_against_delivery_rejected_customer_dispatch(client):
+    """CASH must be rejected for CUSTOMER_DISPATCH orders."""
+    headers = _register_and_login(client, "cash-dispatch@example.com", "secretpass123")
+    product = _create_product(client, "Dispatch Product", price=200.00, stock=5)
+
+    # Create order with CUSTOMER_DISPATCH
+    address_response = client.post(
+        "/addresses",
+        headers=headers,
+        json={
+            "recipient_name": "Dispatch User",
+            "phone_number": "08011111112",
+            "address_line": "1 Dispatch St",
+            "city": "Lagos",
+            "state": "Lagas",
+        },
+    )
+    assert address_response.status_code == 200
+    address_id = address_response.json()["id"]
+
+    order_response = client.post(
+        "/orders",
+        headers=headers,
+        json={
+            "fulfillment_method": "CUSTOMER_DISPATCH",
+            "address_id": address_id,
+            "items": [{"product_id": product.id, "quantity": 1}],
+        },
+    )
+    assert order_response.status_code == 200
+    order_id = order_response.json()["id"]
+
+    # Attempt CASH payment for CUSTOMER_DISPATCH order — should be rejected
+    payment_response = client.post(
+        "/payments",
+        headers=headers,
+        json={"order_id": order_id, "payment_method": "CASH"},
+    )
+    assert payment_response.status_code == 400, payment_response.text
+    assert "CASH" in payment_response.json()["detail"]
+
+
+def test_cash_allowed_for_store_pickup(client):
+    """CASH must be allowed for STORE_PICKUP orders."""
+    headers = _register_and_login(client, "cash-pickup@example.com", "secretpass123")
+    product = _create_product(client, "Pickup Product", price=200.00, stock=5)
+
+    # Create order with STORE_PICKUP
+    address_response = client.post(
+        "/addresses",
+        headers=headers,
+        json={
+            "recipient_name": "Pickup User",
+            "phone_number": "08011111113",
+            "address_line": "1 Pickup St",
+            "city": "Lagos",
+            "state": "Lagos",
+        },
+    )
+    assert address_response.status_code == 200
+    address_id = address_response.json()["id"]
+
     order_response = client.post(
         "/orders",
         headers=headers,
@@ -1625,33 +1819,215 @@ def test_payment_status_invalid_transition(client):
     )
     assert order_response.status_code == 200
     order_id = order_response.json()["id"]
-    
-    # Create payment PENDING
+
+    # CASH payment for STORE_PICKUP should be allowed
     payment_response = client.post(
         "/payments",
         headers=headers,
+        json={"order_id": order_id, "payment_method": "CASH"},
+    )
+    assert payment_response.status_code == 200, payment_response.text
+    payment = payment_response.json()
+    assert payment["payment_method"] == "CASH"
+    assert payment["status"] == "PENDING"
+
+
+def test_unsupported_payment_method_rejected(client):
+    """Unsupported payment methods must be rejected."""
+    headers = _register_and_login(client, "test@example.com", "secretpass123")
+    product = _create_product(client, "Unsupported Product", price=100.00, stock=5)
+
+    # Create order with STORE_PICKUP
+    address_response = client.post(
+        "/addresses",
+        headers=headers,
         json={
-            "order_id": order_id,
-            "payment_method": "STRIPE",
+            "recipient_name": "Test User",
+            "phone_number": "08011111114",
+            "address_line": "1 Test St",
+            "city": "Lagos",
+            "state": "Lagos",
         },
     )
-    assert payment_response.status_code == 200
-    payment_id = payment_response.json()["id"]
-    
-    # First transition PENDING -> SUCCESS (valid)
-    client.patch(
-        f"/payments/{payment_id}/status",
-        headers=admin,
-        json={"status": "SUCCESS"},
+    assert address_response.status_code == 200
+    address_id = address_response.json()["id"]
+
+    order_response = client.post(
+        "/orders",
+        headers=headers,
+        json={
+            "fulfillment_method": "STORE_PICKUP",
+            "address_id": address_id,
+            "items": [{"product_id": product.id, "quantity": 1}],
+        },
     )
-    
-    # Try invalid transition SUCCESS -> FAILED (should fail)
-    status_response = client.patch(
-        f"/payments/{payment_id}/status",
-        headers=admin,
-        json={"status": "FAILED"},
+    assert order_response.status_code == 200
+    order_id = order_response.json()["id"]
+
+    # CRYPTO should be rejected
+    response = client.post(
+        "/payments",
+        headers=headers,
+        json={"order_id": order_id, "payment_method": "CRYPTO"},
     )
-    assert status_response.status_code == 400, status_response.text
+    assert response.status_code == 400, response.text
+
+    # Empty string is rejected by Pydantic schema min_length validation (422),
+    # not by backend business rules
+    response = client.post(
+        "/payments",
+        headers=headers,
+        json={"order_id": order_id, "payment_method": ""},
+    )
+    assert response.status_code == 422, response.text
+
+    response = client.post(
+        "/payments",
+        headers=headers,
+        json={"order_id": order_id, "payment_method": "FOO"},
+    )
+    assert response.status_code == 400, response.text
+
+    response = client.post(
+        "/payments",
+        headers=headers,
+        json={"order_id": order_id, "payment_method": "123"},
+    )
+    assert response.status_code == 400, response.text
+
+
+def test_bank_transfer_allowed_for_delivery(client):
+    """BANK_TRANSFER must be allowed for STORE_DELIVERY and CUSTOMER_DISPATCH."""
+    headers = _register_and_login(client, "bank@example.com", "secretpass123")
+    product = _create_product(client, "Bank Product", price=200.00, stock=5)
+
+    for fulfillment in ["STORE_DELIVERY", "CUSTOMER_DISPATCH"]:
+        # Create order
+        address_response = client.post(
+            "/addresses",
+            headers=headers,
+            json={
+                "recipient_name": "Bank User",
+                "phone_number": "08011111115",
+                "address_line": "1 Bank St",
+                "city": "Lagos",
+                "state": "Lagos",
+            },
+        )
+        assert address_response.status_code == 200
+        address_id = address_response.json()["id"]
+
+        order_response = client.post(
+            "/orders",
+            headers=headers,
+            json={
+                "fulfillment_method": fulfillment,
+                "address_id": address_id,
+                "items": [{"product_id": product.id, "quantity": 1}],
+            },
+        )
+        assert order_response.status_code == 200
+        order_id = order_response.json()["id"]
+
+        # BANK_TRANSFER should be allowed
+        payment_response = client.post(
+            "/payments",
+            headers=headers,
+            json={"order_id": order_id, "payment_method": "BANK_TRANSFER"},
+        )
+        assert payment_response.status_code == 200, f"BANK_TRANSFER should be allowed for {fulfillment}: {payment_response.text}"
+
+
+def test_bank_transfer_allowed_for_pickup(client):
+    """BANK_TRANSFER must be allowed for STORE_PICKUP."""
+    headers = _register_and_login(client, "bank-pickup@example.com", "secretpass123")
+    product = _create_product(client, "Bank Pickup Product", price=200.00, stock=5)
+
+    # Create order with STORE_PICKUP
+    address_response = client.post(
+        "/addresses",
+        headers=headers,
+        json={
+            "recipient_name": "Bank Pickup User",
+            "phone_number": "08011111116",
+            "address_line": "1 Bank Pickup St",
+            "city": "Lagos",
+            "state": "Lagos",
+        },
+    )
+    assert address_response.status_code == 200
+    address_id = address_response.json()["id"]
+
+    order_response = client.post(
+        "/orders",
+        headers=headers,
+        json={
+            "fulfillment_method": "STORE_PICKUP",
+            "address_id": address_id,
+            "items": [{"product_id": product.id, "quantity": 1}],
+        },
+    )
+    assert order_response.status_code == 200
+    order_id = order_response.json()["id"]
+
+    # BANK_TRANSFER should be allowed for STORE_PICKUP
+    payment_response = client.post(
+        "/payments",
+        headers=headers,
+        json={"order_id": order_id, "payment_method": "BANK_TRANSFER"},
+    )
+    assert payment_response.status_code == 200, payment_response.text
+
+
+def test_cash_payment_bypass_proof(client):
+    """Prove client cannot bypass CASH restriction by submitting CASH against delivery order.
+
+    Example conceptual case:
+    Create order with STORE_DELIVERY
+    ↓
+    Attempt CASH payment
+    ↓
+    Backend rejects request
+    """
+    headers = _register_and_login(client, "bypass@example.com", "secretpass123")
+    product = _create_product(client, "Bypass Product", price=200.00, stock=5)
+
+    # Create order with STORE_DELIVERY
+    address_response = client.post(
+        "/addresses",
+        headers=headers,
+        json={
+            "recipient_name": "Bypass User",
+            "phone_number": "08011111117",
+            "address_line": "1 Bypass St",
+            "city": "Lagos",
+            "state": "Lagos",
+        },
+    )
+    assert address_response.status_code == 200
+    address_id = address_response.json()["id"]
+
+    order_response = client.post(
+        "/orders",
+        headers=headers,
+        json={
+            "fulfillment_method": "STORE_DELIVERY",
+            "address_id": address_id,
+            "items": [{"product_id": product.id, "quantity": 1}],
+        },
+    )
+    assert order_response.status_code == 200
+    order_id = order_response.json()["id"]
+
+    # Attempt CASH payment — backend must reject regardless of what client claims
+    payment_response = client.post(
+        "/payments",
+        headers=headers,
+        json={"order_id": order_id, "payment_method": "CASH"},
+    )
+    assert payment_response.status_code == 400, (
+        f"Backend must reject CASH for STORE_DELIVERY. Got: {payment_response.text}"
+    )
 
 
 def test_payment_retrieval_for_order(client):

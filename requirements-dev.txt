@@ -1,0 +1,16 @@
+# Development / test-only dependencies for the Phase 5D PostgreSQL import
+# rehearsal. Production runtime dependencies stay in requirements.txt (which
+# already includes pymysql and psycopg2-binary, both required by the import
+# utility's execution path).
+#
+# Install for local testing / rehearsal with:
+#     pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# Test framework (present in the dev environment; not pinned in requirements.txt)
+pytest>=8,<9
+
+# Required by fastapi.testclient.TestClient (used by the existing suite and the
+# PostgreSQL smoke suite). Currently imported by tests but NOT declared anywhere.
+httpx>=0.27,<0.29
