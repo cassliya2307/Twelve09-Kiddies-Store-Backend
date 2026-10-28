@@ -1,5 +1,6 @@
 from .user import Permission, User, UserRole
 from .category import Category
+from .homepage_category_configuration import HomepageCategoryConfiguration
 from .product import Product
 from .address import Address
 from .order import FulfillmentMethod, Order, OrderItem, OrderStatus
@@ -12,6 +13,7 @@ __all__ = [
     "UserRole",
     "Permission",
     "Category",
+    "HomepageCategoryConfiguration",
     "Product",
     "Address",
     "Order",

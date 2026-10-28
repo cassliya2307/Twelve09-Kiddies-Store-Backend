@@ -30,6 +30,7 @@ from app.models import (
     Category,
     DeliveryConfig,
     FulfillmentMethod,
+    HomepageCategoryConfiguration,
     Order,
     OrderItem,
     OrderStatus,
@@ -66,6 +67,11 @@ from app.schemas.product import (
     ProductRead,
     ProductUpdate,
     StockUpdate,
+)
+from app.schemas.homepage_category import (
+    HomepageCategoryAdminEntry,
+    HomepageCategoryPublicEntry,
+    HomepageCategorySelectionRequest,
 )
 from app.schemas.product_image import (
     ProductImageDeleteResponse,
@@ -834,6 +840,144 @@ def create_category(
     db.commit()
     db.refresh(category)
     return category
+
+
+HOMEPAGE_CATEGORY_ICON_KEYS = frozenset({
+    "backpack",
+    "blocks",
+    "gift",
+    "shirt",
+    "shopping-bag",
+})
+DEFAULT_HOMEPAGE_CATEGORY_ICON_KEY = "backpack"
+
+
+def _safe_homepage_category_icon_key(icon_key: str | None) -> str:
+    if icon_key in HOMEPAGE_CATEGORY_ICON_KEYS:
+        return icon_key
+    return DEFAULT_HOMEPAGE_CATEGORY_ICON_KEY
+
+
+def _homepage_category_admin_entries(db: Session) -> list[HomepageCategoryAdminEntry]:
+    rows = (
+        db.query(HomepageCategoryConfiguration, Category)
+        .join(Category, Category.id == HomepageCategoryConfiguration.category_id)
+        .order_by(HomepageCategoryConfiguration.display_order.asc())
+        .all()
+    )
+    return [
+        HomepageCategoryAdminEntry(
+            id=configuration.id,
+            category_id=configuration.category_id,
+            category_name=category.name,
+            category_is_active=category.is_active,
+            label=configuration.label,
+            icon_key=_safe_homepage_category_icon_key(configuration.icon_key),
+            display_order=configuration.display_order,
+        )
+        for configuration, category in rows
+    ]
+
+
+@app.get(
+    "/homepage-categories",
+    response_model=list[HomepageCategoryPublicEntry],
+)
+def list_homepage_categories(db: Session = Depends(get_db)) -> list[HomepageCategoryPublicEntry]:
+    rows = (
+        db.query(HomepageCategoryConfiguration, Category)
+        .join(Category, Category.id == HomepageCategoryConfiguration.category_id)
+        .filter(Category.is_active == True)
+        .order_by(HomepageCategoryConfiguration.display_order.asc())
+        .all()
+    )
+    return [
+        HomepageCategoryPublicEntry(
+            category_id=configuration.category_id,
+            category_name=category.name,
+            label=configuration.label,
+            icon_key=_safe_homepage_category_icon_key(configuration.icon_key),
+            display_order=configuration.display_order,
+        )
+        for configuration, category in rows
+    ]
+
+
+@app.get(
+    "/admin/homepage-categories",
+    response_model=list[HomepageCategoryAdminEntry],
+)
+def get_admin_homepage_categories(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[HomepageCategoryAdminEntry]:
+    if not require_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator privileges required",
+        )
+    return _homepage_category_admin_entries(db)
+
+
+@app.put(
+    "/admin/homepage-categories",
+    response_model=list[HomepageCategoryAdminEntry],
+)
+def replace_admin_homepage_categories(
+    payload: HomepageCategorySelectionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[HomepageCategoryAdminEntry]:
+    if not require_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator privileges required",
+        )
+
+    category_ids = [item.category_id for item in payload.items]
+    if len(category_ids) != len(set(category_ids)):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Category IDs must be unique")
+
+    display_orders = [item.display_order for item in payload.items]
+    if len(display_orders) != len(set(display_orders)):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Display orders must be unique")
+
+    for item in payload.items:
+        if not item.label.strip():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Labels must not be empty")
+        if item.icon_key not in HOMEPAGE_CATEGORY_ICON_KEYS:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid homepage category icon key")
+
+    if category_ids:
+        eligible_ids = {
+            category_id
+            for (category_id,) in db.query(Category.id)
+            .filter(Category.id.in_(category_ids), Category.is_active == True)
+            .all()
+        }
+        if eligible_ids != set(category_ids):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Every selected category must exist and be active",
+            )
+
+    try:
+        db.query(HomepageCategoryConfiguration).delete(synchronize_session=False)
+        db.add_all([
+            HomepageCategoryConfiguration(
+                category_id=item.category_id,
+                label=item.label,
+                icon_key=item.icon_key,
+                display_order=item.display_order,
+            )
+            for item in payload.items
+        ])
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return _homepage_category_admin_entries(db)
 
 
 def _validate_checkout_items(
